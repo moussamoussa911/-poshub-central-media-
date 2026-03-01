@@ -47,6 +47,7 @@ from fastapi import (
     FastAPI,
     Header,
     HTTPException,
+    Response,
     WebSocket,
     WebSocketDisconnect,
     UploadFile,
@@ -1396,6 +1397,45 @@ def create_app(
     app.state.rate_limit_pdf_window = _env_int("POS_HUB_RATE_LIMIT_PDF_WINDOW_SEC", 60, 1, 3600)
     app.state.max_request_bytes = _env_int("POS_HUB_MAX_REQUEST_BYTES", 15 * 1024 * 1024, 64 * 1024, 1024 * 1024 * 1024)
 
+    # Gallery admin cookie session (simple secure operator login).
+    _gallery_sessions: dict[str, float] = {}
+    _GALLERY_COOKIE = "gallery_admin_session"
+    _GALLERY_TTL_SEC = int(_env_int("POS_HUB_GALLERY_SESSION_TTL_SEC", 12 * 3600, 900, 7 * 24 * 3600))
+
+    def _gallery_session_purge(now_ts: Optional[float] = None):
+        t = float(now_ts or time.time())
+        dead = [k for k, exp in _gallery_sessions.items() if float(exp or 0.0) <= t]
+        for k in dead:
+            _gallery_sessions.pop(k, None)
+
+    def _gallery_session_issue() -> tuple[str, float]:
+        _gallery_session_purge()
+        tok = secrets.token_urlsafe(32)
+        exp = float(time.time() + _GALLERY_TTL_SEC)
+        _gallery_sessions[tok] = exp
+        return tok, exp
+
+    def _gallery_session_check(request: Request) -> bool:
+        _gallery_session_purge()
+        try:
+            tok = str(request.cookies.get(_GALLERY_COOKIE) or "").strip()
+        except Exception:
+            tok = ""
+        if not tok:
+            return False
+        exp = float(_gallery_sessions.get(tok) or 0.0)
+        if exp <= float(time.time()):
+            _gallery_sessions.pop(tok, None)
+            return False
+        return True
+
+    def _auth_gallery_admin(request: Request, x_api_key: Optional[str]) -> dict:
+        # 1) Operator cookie session
+        if _gallery_session_check(request):
+            return {"kind": "gallery_session", "tenant_id": "", "location_id": "", "sub": "gallery-admin"}
+        # 2) Fallback API key header (for scripts/tools)
+        return _auth(x_api_key)
+
     # Strong warning for deployments that likely lose data on redeploy.
     if str(os.environ.get("RENDER", "")).strip().lower() == "true":
         if not os.environ.get("POS_HUB_DATA_DIR", "").strip() and not os.environ.get("POS_HUB_DB_PATH", "").strip():
@@ -2729,7 +2769,7 @@ def create_app(
         category: str = Form("all"),
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth(x_api_key)
+        _auth_gallery_admin(request, x_api_key)
 
         original = os.path.basename((file.filename or "").strip() or "image.png")
         ext = os.path.splitext(original)[1].lower()
@@ -2775,7 +2815,7 @@ def create_app(
         category: str = "all",
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth(x_api_key)
+        _auth_gallery_admin(request, x_api_key)
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         cat = re.sub(r"[^a-z0-9_\-]+", "_", str(category or "all").strip().lower()).strip("_") or "all"
         files = []
@@ -2821,8 +2861,11 @@ def create_app(
         return {"ok": True, "category": cat, "count": len(files), "items": files}
 
     @api.get("/gallery/categories")
-    def api_gallery_categories(x_api_key: Optional[str] = Header(default=None)) -> dict:
-        _auth(x_api_key)
+    def api_gallery_categories(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth_gallery_admin(request, x_api_key)
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         root.mkdir(parents=True, exist_ok=True)
         out = []
@@ -2841,10 +2884,11 @@ def create_app(
 
     @api.post("/gallery/categories")
     def api_gallery_category_create(
+        request: Request,
         name: str = Form(...),
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth(x_api_key)
+        _auth_gallery_admin(request, x_api_key)
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         cat = re.sub(r"[^a-z0-9_\-]+", "_", str(name or "").strip().lower()).strip("_")
         if not cat:
@@ -2855,11 +2899,12 @@ def create_app(
 
     @api.delete("/gallery/categories")
     def api_gallery_category_delete(
+        request: Request,
         name: str,
         move_to: str = "all",
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth(x_api_key)
+        _auth_gallery_admin(request, x_api_key)
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         cat = re.sub(r"[^a-z0-9_\-]+", "_", str(name or "").strip().lower()).strip("_")
         mv = re.sub(r"[^a-z0-9_\-]+", "_", str(move_to or "all").strip().lower()).strip("_") or "all"
@@ -2891,11 +2936,12 @@ def create_app(
 
     @api.post("/gallery/move")
     def api_gallery_move(
+        request: Request,
         rel_path: str = Form(...),
         new_category: str = Form(...),
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth(x_api_key)
+        _auth_gallery_admin(request, x_api_key)
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         safe_rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
         if not safe_rel or ".." in safe_rel:
@@ -2921,10 +2967,11 @@ def create_app(
 
     @api.delete("/gallery/item")
     def api_gallery_delete(
+        request: Request,
         rel_path: str,
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth(x_api_key)
+        _auth_gallery_admin(request, x_api_key)
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         safe_rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
         if not safe_rel or ".." in safe_rel:
@@ -2936,6 +2983,71 @@ def create_app(
             raise HTTPException(status_code=404, detail="file not found")
         p.unlink(missing_ok=False)
         return {"ok": True}
+
+    @api.post("/gallery/delete_many")
+    async def api_gallery_delete_many(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth_gallery_admin(request, x_api_key)
+        payload = await _read_payload_any(request)
+        rels = payload.get("rel_paths") if isinstance(payload, dict) else None
+        if not isinstance(rels, list):
+            raise HTTPException(status_code=400, detail="rel_paths list required")
+        root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
+        ok = 0
+        fail = 0
+        for raw in rels:
+            try:
+                safe_rel = str(raw or "").strip().replace("\\", "/").lstrip("/")
+                if not safe_rel or ".." in safe_rel:
+                    fail += 1
+                    continue
+                p = (root / safe_rel).resolve()
+                if not str(p).startswith(str(root)) or (not p.exists()) or (not p.is_file()):
+                    fail += 1
+                    continue
+                p.unlink(missing_ok=False)
+                ok += 1
+            except Exception:
+                fail += 1
+        return {"ok": True, "deleted": ok, "failed": fail}
+
+    @api.post("/gallery/move_many")
+    async def api_gallery_move_many(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth_gallery_admin(request, x_api_key)
+        payload = await _read_payload_any(request)
+        rels = payload.get("rel_paths") if isinstance(payload, dict) else None
+        nc = payload.get("new_category") if isinstance(payload, dict) else None
+        if not isinstance(rels, list) or not rels:
+            raise HTTPException(status_code=400, detail="rel_paths list required")
+        cat = re.sub(r"[^a-z0-9_\-]+", "_", str(nc or "all").strip().lower()).strip("_") or "all"
+        root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
+        dst_dir = (root / cat).resolve()
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        moved = 0
+        failed = 0
+        for raw in rels:
+            try:
+                safe_rel = str(raw or "").strip().replace("\\", "/").lstrip("/")
+                if not safe_rel or ".." in safe_rel:
+                    failed += 1
+                    continue
+                src = (root / safe_rel).resolve()
+                if not str(src).startswith(str(root)) or (not src.exists()) or (not src.is_file()):
+                    failed += 1
+                    continue
+                dst = (dst_dir / src.name).resolve()
+                if dst.exists():
+                    dst = (dst_dir / f"{src.stem}_{uuid.uuid4().hex[:8]}{src.suffix}").resolve()
+                shutil.move(str(src), str(dst))
+                moved += 1
+            except Exception:
+                failed += 1
+        return {"ok": True, "moved": moved, "failed": failed, "category": cat}
 
     @api.put("/menu/{item_id}")
     async def api_menu_update(item_id: int, request: Request, x_api_key: Optional[str] = Header(default=None)) -> dict:
@@ -4689,6 +4801,46 @@ def create_app(
     # Register /api routes now
     app.include_router(api)
 
+    @app.post("/gallery-admin/login")
+    async def gallery_admin_login(request: Request):
+        payload = await _read_payload_any(request)
+        raw_key = ""
+        if isinstance(payload, dict):
+            raw_key = str(payload.get("api_key") or payload.get("apiKey") or "").strip()
+        if not raw_key:
+            raise HTTPException(status_code=400, detail="api_key required")
+        _auth(raw_key)  # validates against server auth mode/key logic
+        token, exp = _gallery_session_issue()
+        from fastapi.responses import JSONResponse
+        r = JSONResponse({"ok": True, "expires_at": int(exp)})
+        r.set_cookie(
+            key=_GALLERY_COOKIE,
+            value=token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=int(_GALLERY_TTL_SEC),
+            path="/",
+        )
+        return r
+
+    @app.post("/gallery-admin/logout")
+    def gallery_admin_logout(request: Request):
+        try:
+            tok = str(request.cookies.get(_GALLERY_COOKIE) or "").strip()
+            if tok:
+                _gallery_sessions.pop(tok, None)
+        except Exception:
+            pass
+        from fastapi.responses import JSONResponse
+        r = JSONResponse({"ok": True})
+        r.delete_cookie(_GALLERY_COOKIE, path="/")
+        return r
+
+    @app.get("/gallery-admin/me")
+    def gallery_admin_me(request: Request):
+        return {"ok": bool(_gallery_session_check(request))}
+
     @app.get("/gallery-admin")
     def gallery_admin_page():
         html = """<!doctype html>
@@ -4754,11 +4906,17 @@ def create_app(
     </div>
 
     <div class="toolbar card">
-      <label>API Key</label>
-      <input id="apiKey" type="password" style="min-width:320px" placeholder="POS_HUB_API_KEY" />
-      <button class="alt" onclick="saveKey()">Save Key</button>
-      <button onclick="bootstrap()">Reload</button>
-      <span class="stats" id="statsTop"></span>
+      <div class="row" id="loginRow">
+        <label>Admin Login</label>
+        <input id="apiKey" type="password" style="min-width:320px" placeholder="Enter admin API key once" />
+        <button class="ok" onclick="login()">Sign In</button>
+      </div>
+      <div class="row" id="loggedRow" style="display:none">
+        <span class="stats">Logged in</span>
+        <button class="alt" onclick="bootstrap()">Reload</button>
+        <button class="danger" onclick="logout()">Logout</button>
+        <span class="stats" id="statsTop"></span>
+      </div>
     </div>
 
     <div class="grid-layout">
@@ -4796,6 +4954,8 @@ def create_app(
             <div class="title" style="margin:0">Images</div>
             <input id="search" placeholder="search name..." oninput="renderGrid()" />
             <button onclick="loadItems()">Refresh</button>
+            <button class="alt" onclick="moveSelected()">Move Selected</button>
+            <button class="danger" onclick="deleteSelected()">Delete Selected</button>
           </div>
           <div class="msg" id="msg"></div>
           <div id="gallery" class="gallery"></div>
@@ -4809,9 +4969,15 @@ let categories = [];
 let items = [];
 let currentCategory = "all";
 let selectedFiles = [];
+let checked = new Set();
 
-function apiHeaders(){
-  return {"X-Api-Key": document.getElementById("apiKey").value || ""};
+async function apiFetch(url, options={}){
+  const opt = Object.assign({}, options || {});
+  opt.credentials = "include";
+  if(opt.body && !(opt.body instanceof FormData)){
+    opt.headers = Object.assign({"Content-Type":"application/json"}, opt.headers || {});
+  }
+  return fetch(url, opt);
 }
 function setMsg(t, ok=false){
   const m = document.getElementById("msg");
@@ -4821,9 +4987,28 @@ function setMsg(t, ok=false){
 function esc(s){
   return String(s||"").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-function saveKey(){
-  localStorage.setItem("gallery_admin_key", document.getElementById("apiKey").value || "");
-  setMsg("API key saved locally in browser.", true);
+async function login(){
+  const key = document.getElementById("apiKey").value || "";
+  if(!key.trim()){ setMsg("Enter API key."); return; }
+  const r = await apiFetch("/gallery-admin/login", {
+    method:"POST",
+    body: JSON.stringify({api_key:key})
+  });
+  if(!r.ok){ setMsg("Login failed: " + r.status); return; }
+  document.getElementById("apiKey").value = "";
+  await bootstrap();
+}
+async function logout(){
+  await apiFetch("/gallery-admin/logout", {method:"POST"});
+  document.getElementById("loginRow").style.display = "";
+  document.getElementById("loggedRow").style.display = "none";
+  setMsg("Logged out.", true);
+}
+async function authCheck(){
+  const r = await apiFetch("/gallery-admin/me");
+  if(!r.ok) return false;
+  const j = await r.json();
+  return !!(j && j.ok);
 }
 function humanSize(n){
   let x = Number(n||0);
@@ -4833,7 +5018,7 @@ function humanSize(n){
 }
 
 async function loadCategories(){
-  const r = await fetch("/api/gallery/categories", {headers: apiHeaders()});
+  const r = await apiFetch("/api/gallery/categories");
   if(!r.ok){ throw new Error("categories load failed: "+r.status); }
   const j = await r.json();
   categories = Array.isArray(j.items) ? j.items : [];
@@ -4867,7 +5052,7 @@ async function createCategory(){
   if(!raw.trim()){ setMsg("Enter category name."); return; }
   const fd = new FormData();
   fd.append("name", raw);
-  const r = await fetch("/api/gallery/categories", {method:"POST", headers:apiHeaders(), body:fd});
+  const r = await apiFetch("/api/gallery/categories", {method:"POST", body:fd});
   if(!r.ok){ setMsg("Create category failed: "+r.status); return; }
   document.getElementById("newCat").value = "";
   await loadCategories();
@@ -4879,8 +5064,8 @@ async function deleteCategory(){
   const moveTo = document.getElementById("moveToCat").value || "all";
   if(currentCategory === moveTo){ setMsg("Choose different move target."); return; }
   if(!confirm(`Delete category '${currentCategory}' and move files to '${moveTo}'?`)) return;
-  const r = await fetch(`/api/gallery/categories?name=${encodeURIComponent(currentCategory)}&move_to=${encodeURIComponent(moveTo)}`, {
-    method:"DELETE", headers: apiHeaders()
+  const r = await apiFetch(`/api/gallery/categories?name=${encodeURIComponent(currentCategory)}&move_to=${encodeURIComponent(moveTo)}`, {
+    method:"DELETE"
   });
   if(!r.ok){ setMsg("Delete category failed: "+r.status); return; }
   currentCategory = "all";
@@ -4890,10 +5075,11 @@ async function deleteCategory(){
 }
 
 async function loadItems(){
-  const r = await fetch(`/api/gallery/list?category=${encodeURIComponent(currentCategory)}`, {headers: apiHeaders()});
+  const r = await apiFetch(`/api/gallery/list?category=${encodeURIComponent(currentCategory)}`);
   if(!r.ok){ setMsg("Load images failed: "+r.status); return; }
   const j = await r.json();
   items = Array.isArray(j.items) ? j.items : [];
+  checked = new Set();
   renderGrid();
   document.getElementById("statsTop").textContent = `${items.length} images in '${currentCategory}'`;
 }
@@ -4910,6 +5096,7 @@ function renderGrid(){
     tile.innerHTML = `
       <img class="img" src="${it.url}" loading="lazy" />
       <div class="meta">
+        <div class="row"><input type="checkbox" id="ck_${id}" onchange="toggleCheck('${esc(it.rel_path)}', this.checked)" /></div>
         <div class="name" title="${esc(it.name)}">${esc(it.name)}</div>
         <div class="small">${esc(it.category)} | ${humanSize(it.size)}</div>
         <div class="row">
@@ -4927,7 +5114,7 @@ async function moveItem(rel, inputId){
   const fd = new FormData();
   fd.append("rel_path", decodeURIComponent(rel));
   fd.append("new_category", nc);
-  const r = await fetch("/api/gallery/move", {method:"POST", headers:apiHeaders(), body:fd});
+  const r = await apiFetch("/api/gallery/move", {method:"POST", body:fd});
   if(!r.ok){ setMsg("Move failed: "+r.status); return; }
   await loadCategories();
   await loadItems();
@@ -4936,11 +5123,44 @@ async function moveItem(rel, inputId){
 
 async function deleteItem(rel){
   if(!confirm("Delete this image?")) return;
-  const r = await fetch(`/api/gallery/item?rel_path=${rel}`, {method:"DELETE", headers:apiHeaders()});
+  const r = await apiFetch(`/api/gallery/item?rel_path=${rel}`, {method:"DELETE"});
   if(!r.ok){ setMsg("Delete failed: "+r.status); return; }
   await loadCategories();
   await loadItems();
   setMsg("Image deleted.", true);
+}
+
+function toggleCheck(rel, on){
+  if(on) checked.add(rel); else checked.delete(rel);
+}
+
+async function deleteSelected(){
+  const arr = Array.from(checked.values());
+  if(!arr.length){ setMsg("No items selected."); return; }
+  if(!confirm(`Delete ${arr.length} selected images?`)) return;
+  const r = await apiFetch("/api/gallery/delete_many", {
+    method:"POST",
+    body: JSON.stringify({rel_paths: arr})
+  });
+  if(!r.ok){ setMsg("Delete selected failed: " + r.status); return; }
+  await loadCategories();
+  await loadItems();
+  setMsg("Selected images deleted.", true);
+}
+
+async function moveSelected(){
+  const arr = Array.from(checked.values());
+  if(!arr.length){ setMsg("No items selected."); return; }
+  const nc = prompt("Move selected to category:", currentCategory || "all");
+  if(nc === null) return;
+  const r = await apiFetch("/api/gallery/move_many", {
+    method:"POST",
+    body: JSON.stringify({rel_paths: arr, new_category: nc})
+  });
+  if(!r.ok){ setMsg("Move selected failed: " + r.status); return; }
+  await loadCategories();
+  await loadItems();
+  setMsg("Selected images moved.", true);
 }
 
 function pickFilesFromInput(input){
@@ -4957,7 +5177,7 @@ async function uploadSelected(){
     fd.append("file", f);
     fd.append("category", currentCategory || "all");
     try{
-      const r = await fetch("/api/menu/upload_image", {method:"POST", headers:apiHeaders(), body:fd});
+      const r = await apiFetch("/api/menu/upload_image", {method:"POST", body:fd});
       if(r.ok) ok += 1; else fail += 1;
     }catch(_){ fail += 1; }
   }
@@ -4981,6 +5201,13 @@ function setupDrop(){
 
 async function bootstrap(){
   try{
+    const ok = await authCheck();
+    document.getElementById("loginRow").style.display = ok ? "none" : "";
+    document.getElementById("loggedRow").style.display = ok ? "" : "none";
+    if(!ok){
+      setMsg("Please sign in.");
+      return;
+    }
     await loadCategories();
     await loadItems();
     setMsg("Ready.", true);
@@ -4989,7 +5216,6 @@ async function bootstrap(){
   }
 }
 
-document.getElementById("apiKey").value = localStorage.getItem("gallery_admin_key") || "";
 document.getElementById("filesInput").addEventListener("change", e => pickFilesFromInput(e.target));
 document.getElementById("folderInput").addEventListener("change", e => pickFilesFromInput(e.target));
 setupDrop();

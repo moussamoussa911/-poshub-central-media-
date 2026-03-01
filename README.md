@@ -27,7 +27,11 @@ Central POS-Hub backend for shared menu image gallery across all customers.
 ## URL examples
 - Health: `https://<service>.onrender.com/health`
 - Static image: `https://<service>.onrender.com/static/global_gallery/<category>/<file>`
-- Admin GUI: `https://<service>.onrender.com/gallery-admin` (categories + multi/folder upload + move/delete with API key)
+- Admin GUI: `https://<service>.onrender.com/gallery-admin`
+  - secure login (session cookie)
+  - categories create/delete
+  - multi-file and folder upload
+  - single and batch move/delete
 
 ## Important
 All customers must use the same `online_url` (this Render service URL) to share one gallery.
