@@ -2820,6 +2820,75 @@ def create_app(
         files.sort(key=lambda x: (str(x.get("category") or ""), str(x.get("name") or "")))
         return {"ok": True, "category": cat, "count": len(files), "items": files}
 
+    @api.get("/gallery/categories")
+    def api_gallery_categories(x_api_key: Optional[str] = Header(default=None)) -> dict:
+        _auth(x_api_key)
+        root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        out = []
+        for p in root.iterdir():
+            if not p.is_dir():
+                continue
+            cnt = 0
+            for f in p.glob("*"):
+                if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                    cnt += 1
+            out.append({"name": p.name, "count": cnt})
+        out.sort(key=lambda x: str(x.get("name") or "").lower())
+        if not any(str(x.get("name") or "") == "all" for x in out):
+            out.insert(0, {"name": "all", "count": 0})
+        return {"ok": True, "items": out}
+
+    @api.post("/gallery/categories")
+    def api_gallery_category_create(
+        name: str = Form(...),
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth(x_api_key)
+        root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
+        cat = re.sub(r"[^a-z0-9_\-]+", "_", str(name or "").strip().lower()).strip("_")
+        if not cat:
+            raise HTTPException(status_code=400, detail="invalid category")
+        d = (root / cat).resolve()
+        d.mkdir(parents=True, exist_ok=True)
+        return {"ok": True, "name": cat}
+
+    @api.delete("/gallery/categories")
+    def api_gallery_category_delete(
+        name: str,
+        move_to: str = "all",
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth(x_api_key)
+        root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
+        cat = re.sub(r"[^a-z0-9_\-]+", "_", str(name or "").strip().lower()).strip("_")
+        mv = re.sub(r"[^a-z0-9_\-]+", "_", str(move_to or "all").strip().lower()).strip("_") or "all"
+        if not cat:
+            raise HTTPException(status_code=400, detail="invalid category")
+        if cat == mv:
+            raise HTTPException(status_code=400, detail="name and move_to must differ")
+        src = (root / cat).resolve()
+        if not src.exists() or not src.is_dir():
+            raise HTTPException(status_code=404, detail="category not found")
+        dst = (root / mv).resolve()
+        dst.mkdir(parents=True, exist_ok=True)
+        moved = 0
+        for f in src.glob("*"):
+            if not f.is_file():
+                continue
+            if f.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                continue
+            target = (dst / f.name).resolve()
+            if target.exists():
+                target = (dst / f"{f.stem}_{uuid.uuid4().hex[:8]}{f.suffix}").resolve()
+            shutil.move(str(f), str(target))
+            moved += 1
+        try:
+            src.rmdir()
+        except Exception:
+            pass
+        return {"ok": True, "deleted": cat, "moved_to": mv, "moved_count": moved}
+
     @api.post("/gallery/move")
     def api_gallery_move(
         rel_path: str = Form(...),
@@ -4629,89 +4698,302 @@ def create_app(
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Global Gallery Admin</title>
   <style>
-    body { font-family: Segoe UI, Arial, sans-serif; margin: 16px; background: #f5f7fb; color: #111827; }
-    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
-    input, select, button { padding: 8px; border: 1px solid #d1d5db; border-radius: 8px; }
-    button { cursor: pointer; background: #111827; color: #fff; border: 0; }
-    button.alt { background: #4b5563; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
-    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; }
-    .img { width: 100%; height: 150px; object-fit: cover; background: #e5e7eb; }
-    .meta { padding: 8px; font-size: 12px; }
-    .meta .name { font-weight: 700; }
+    :root {
+      --bg:#f3f6fb; --card:#ffffff; --line:#dbe3ee; --text:#111827; --muted:#586173;
+      --brand:#0f766e; --danger:#b91c1c; --accent:#0b1220;
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: Segoe UI, Arial, sans-serif; background: var(--bg); color: var(--text); }
+    .wrap { max-width: 1440px; margin: 0 auto; padding: 16px; }
+    .top {
+      background: linear-gradient(140deg, #0b1220 0%, #0f766e 100%);
+      color:#fff; border-radius: 14px; padding:14px; margin-bottom:12px;
+    }
+    .top h1 { margin: 0 0 4px 0; font-size: 20px; }
+    .top p { margin: 0; font-size: 13px; opacity: .95; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .grid-layout { display:grid; grid-template-columns: 300px 1fr; gap:12px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; }
+    .title { font-weight:700; margin-bottom:8px; }
+    input, select, button {
+      border-radius:9px; border:1px solid var(--line); padding:8px 10px; font-size: 14px; background:#fff; color:var(--text);
+    }
+    input[type=file] { width: 100%; }
+    button { cursor:pointer; background:var(--accent); color:#fff; border:0; }
+    button.alt { background:#475569; }
+    button.ok { background:var(--brand); }
+    button.danger { background:var(--danger); }
+    .cats { max-height: 360px; overflow:auto; border:1px solid var(--line); border-radius:10px; background:#f8fafc; }
+    .cat-item {
+      display:flex; justify-content:space-between; align-items:center; gap:8px;
+      padding:8px 10px; border-bottom:1px solid #e7edf6; cursor:pointer;
+    }
+    .cat-item:last-child { border-bottom:0; }
+    .cat-item.active { background:#e6fffb; font-weight:700; }
+    .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+    .drop {
+      border:2px dashed #9fb3ca; border-radius:12px; padding:16px; text-align:center; background:#f8fbff; color:var(--muted);
+      margin-top:8px;
+    }
+    .stats { color:var(--muted); font-size:12px; }
+    .gallery { display:grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap:10px; }
+    .tile { background:#fff; border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+    .img { width:100%; height:160px; object-fit:cover; background:#e6ebf2; }
+    .meta { padding:8px; font-size:12px; }
+    .meta .name { font-size:13px; font-weight:700; margin-bottom:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .meta .small { color:var(--muted); margin-bottom:6px; }
+    .msg { margin:8px 0; font-size:13px; min-height:18px; }
+    @media (max-width: 900px) { .grid-layout { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
-  <h2>Global Gallery Admin</h2>
-  <div class="row">
-    <label>API Key:</label>
-    <input id="key" type="password" style="min-width:260px" />
-    <label>Category:</label>
-    <input id="cat" value="all" />
-    <button onclick="loadList()">Load</button>
+  <div class="wrap">
+    <div class="top">
+      <h1>Global Gallery Admin</h1>
+      <p>Create categories, upload images or folders, move and delete files for all customers.</p>
+    </div>
+
+    <div class="toolbar card">
+      <label>API Key</label>
+      <input id="apiKey" type="password" style="min-width:320px" placeholder="POS_HUB_API_KEY" />
+      <button class="alt" onclick="saveKey()">Save Key</button>
+      <button onclick="bootstrap()">Reload</button>
+      <span class="stats" id="statsTop"></span>
+    </div>
+
+    <div class="grid-layout">
+      <div class="card">
+        <div class="title">Categories</div>
+        <div class="row">
+          <input id="newCat" placeholder="new category" style="flex:1" />
+          <button class="ok" onclick="createCategory()">Create</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="danger" onclick="deleteCategory()">Delete Selected</button>
+          <select id="moveToCat"></select>
+        </div>
+        <div class="cats" id="catList" style="margin-top:8px"></div>
+      </div>
+
+      <div>
+        <div class="card" style="margin-bottom:10px">
+          <div class="title">Upload</div>
+          <div class="row">
+            <input id="filesInput" type="file" accept=".png,.jpg,.jpeg,.webp" multiple />
+          </div>
+          <div class="row" style="margin-top:8px">
+            <input id="folderInput" type="file" webkitdirectory directory multiple />
+          </div>
+          <div class="drop" id="dropZone">Drop files here</div>
+          <div class="row" style="margin-top:8px">
+            <button class="ok" onclick="uploadSelected()">Upload Selected</button>
+            <span class="stats" id="uploadInfo">0 files selected</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="toolbar">
+            <div class="title" style="margin:0">Images</div>
+            <input id="search" placeholder="search name..." oninput="renderGrid()" />
+            <button onclick="loadItems()">Refresh</button>
+          </div>
+          <div class="msg" id="msg"></div>
+          <div id="gallery" class="gallery"></div>
+        </div>
+      </div>
+    </div>
   </div>
-  <div class="row">
-    <input id="file" type="file" accept=".png,.jpg,.jpeg,.webp" />
-    <button onclick="upload()">Upload</button>
-  </div>
-  <div id="msg" style="margin:8px 0;color:#b91c1c"></div>
-  <div id="grid" class="grid"></div>
+
 <script>
-function h(k){ return {"X-Api-Key": document.getElementById("key").value || ""}; }
-function msg(t,c){ const m=document.getElementById("msg"); m.style.color=c||"#b91c1c"; m.textContent=t||""; }
-async function loadList(){
-  msg("");
-  const cat = encodeURIComponent(document.getElementById("cat").value || "all");
-  const r = await fetch(`/api/gallery/list?category=${cat}`, {headers:h()});
-  if(!r.ok){ msg("Load failed: "+r.status); return; }
+let categories = [];
+let items = [];
+let currentCategory = "all";
+let selectedFiles = [];
+
+function apiHeaders(){
+  return {"X-Api-Key": document.getElementById("apiKey").value || ""};
+}
+function setMsg(t, ok=false){
+  const m = document.getElementById("msg");
+  m.textContent = t || "";
+  m.style.color = ok ? "#065f46" : "#b91c1c";
+}
+function esc(s){
+  return String(s||"").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function saveKey(){
+  localStorage.setItem("gallery_admin_key", document.getElementById("apiKey").value || "");
+  setMsg("API key saved locally in browser.", true);
+}
+function humanSize(n){
+  let x = Number(n||0);
+  if(x < 1024) return `${x} B`;
+  if(x < 1024*1024) return `${(x/1024).toFixed(1)} KB`;
+  return `${(x/(1024*1024)).toFixed(1)} MB`;
+}
+
+async function loadCategories(){
+  const r = await fetch("/api/gallery/categories", {headers: apiHeaders()});
+  if(!r.ok){ throw new Error("categories load failed: "+r.status); }
   const j = await r.json();
-  const grid = document.getElementById("grid");
-  grid.innerHTML = "";
-  (j.items||[]).forEach(it=>{
-    const el = document.createElement("div");
-    el.className = "card";
-    el.innerHTML = `
-      <img class="img" src="${it.url}" />
+  categories = Array.isArray(j.items) ? j.items : [];
+  if(!categories.find(x => x.name === currentCategory)){ currentCategory = "all"; }
+
+  const catList = document.getElementById("catList");
+  catList.innerHTML = "";
+  categories.forEach(c => {
+    const row = document.createElement("div");
+    row.className = "cat-item" + (c.name === currentCategory ? " active" : "");
+    row.innerHTML = `<span>${esc(c.name)}</span><span class="stats">${Number(c.count||0)}</span>`;
+    row.onclick = () => { currentCategory = c.name; renderCategories(); loadItems(); };
+    catList.appendChild(row);
+  });
+  renderCategories();
+}
+
+function renderCategories(){
+  const catList = document.getElementById("catList");
+  [...catList.children].forEach((el, idx) => {
+    const c = categories[idx];
+    el.classList.toggle("active", c && c.name === currentCategory);
+  });
+  const moveSel = document.getElementById("moveToCat");
+  moveSel.innerHTML = categories.map(c => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join("");
+  moveSel.value = categories.find(c=>c.name==="all") ? "all" : (categories[0]?.name || "");
+}
+
+async function createCategory(){
+  const raw = document.getElementById("newCat").value || "";
+  if(!raw.trim()){ setMsg("Enter category name."); return; }
+  const fd = new FormData();
+  fd.append("name", raw);
+  const r = await fetch("/api/gallery/categories", {method:"POST", headers:apiHeaders(), body:fd});
+  if(!r.ok){ setMsg("Create category failed: "+r.status); return; }
+  document.getElementById("newCat").value = "";
+  await loadCategories();
+  setMsg("Category created.", true);
+}
+
+async function deleteCategory(){
+  if(currentCategory === "all"){ setMsg("Cannot delete category 'all'."); return; }
+  const moveTo = document.getElementById("moveToCat").value || "all";
+  if(currentCategory === moveTo){ setMsg("Choose different move target."); return; }
+  if(!confirm(`Delete category '${currentCategory}' and move files to '${moveTo}'?`)) return;
+  const r = await fetch(`/api/gallery/categories?name=${encodeURIComponent(currentCategory)}&move_to=${encodeURIComponent(moveTo)}`, {
+    method:"DELETE", headers: apiHeaders()
+  });
+  if(!r.ok){ setMsg("Delete category failed: "+r.status); return; }
+  currentCategory = "all";
+  await loadCategories();
+  await loadItems();
+  setMsg("Category deleted and files moved.", true);
+}
+
+async function loadItems(){
+  const r = await fetch(`/api/gallery/list?category=${encodeURIComponent(currentCategory)}`, {headers: apiHeaders()});
+  if(!r.ok){ setMsg("Load images failed: "+r.status); return; }
+  const j = await r.json();
+  items = Array.isArray(j.items) ? j.items : [];
+  renderGrid();
+  document.getElementById("statsTop").textContent = `${items.length} images in '${currentCategory}'`;
+}
+
+function renderGrid(){
+  const q = (document.getElementById("search").value || "").toLowerCase().trim();
+  const list = q ? items.filter(it => `${it.name} ${it.category}`.toLowerCase().includes(q)) : items;
+  const root = document.getElementById("gallery");
+  root.innerHTML = "";
+  list.forEach(it => {
+    const id = btoa(it.rel_path).replace(/=/g,"_");
+    const tile = document.createElement("div");
+    tile.className = "tile";
+    tile.innerHTML = `
+      <img class="img" src="${it.url}" loading="lazy" />
       <div class="meta">
-        <div class="name">${it.name}</div>
-        <div>Category: ${it.category}</div>
-        <div class="row" style="margin-top:6px">
-          <input value="${it.category}" id="mv_${btoa(it.rel_path).replace(/=/g,'_')}" />
-          <button class="alt" onclick="moveItem('${encodeURIComponent(it.rel_path)}','mv_${btoa(it.rel_path).replace(/=/g,'_')}')">Move</button>
-          <button onclick="delItem('${encodeURIComponent(it.rel_path)}')">Delete</button>
+        <div class="name" title="${esc(it.name)}">${esc(it.name)}</div>
+        <div class="small">${esc(it.category)} | ${humanSize(it.size)}</div>
+        <div class="row">
+          <input id="mv_${id}" value="${esc(it.category)}" style="flex:1" />
+          <button class="alt" onclick="moveItem('${encodeURIComponent(it.rel_path)}','mv_${id}')">Move</button>
+          <button class="danger" onclick="deleteItem('${encodeURIComponent(it.rel_path)}')">Delete</button>
         </div>
       </div>`;
-    grid.appendChild(el);
+    root.appendChild(tile);
   });
-  msg(`Loaded ${j.count} images`, "#065f46");
 }
-async function upload(){
-  msg("");
-  const f = document.getElementById("file").files[0];
-  if(!f){ msg("Select file first"); return; }
-  const fd = new FormData();
-  fd.append("file", f);
-  fd.append("category", document.getElementById("cat").value || "all");
-  const r = await fetch("/api/menu/upload_image", {method:"POST", headers:h(), body:fd});
-  if(!r.ok){ msg("Upload failed: "+r.status); return; }
-  msg("Upload OK", "#065f46");
-  await loadList();
-}
-async function delItem(rel){
-  if(!confirm("Delete image?")) return;
-  const r = await fetch(`/api/gallery/item?rel_path=${rel}`, {method:"DELETE", headers:h()});
-  if(!r.ok){ msg("Delete failed: "+r.status); return; }
-  await loadList();
-}
-async function moveItem(rel, id){
-  const nc = document.getElementById(id).value || "all";
+
+async function moveItem(rel, inputId){
+  const nc = document.getElementById(inputId).value || "all";
   const fd = new FormData();
   fd.append("rel_path", decodeURIComponent(rel));
   fd.append("new_category", nc);
-  const r = await fetch("/api/gallery/move", {method:"POST", headers:h(), body:fd});
-  if(!r.ok){ msg("Move failed: "+r.status); return; }
-  await loadList();
+  const r = await fetch("/api/gallery/move", {method:"POST", headers:apiHeaders(), body:fd});
+  if(!r.ok){ setMsg("Move failed: "+r.status); return; }
+  await loadCategories();
+  await loadItems();
+  setMsg("Image moved.", true);
 }
+
+async function deleteItem(rel){
+  if(!confirm("Delete this image?")) return;
+  const r = await fetch(`/api/gallery/item?rel_path=${rel}`, {method:"DELETE", headers:apiHeaders()});
+  if(!r.ok){ setMsg("Delete failed: "+r.status); return; }
+  await loadCategories();
+  await loadItems();
+  setMsg("Image deleted.", true);
+}
+
+function pickFilesFromInput(input){
+  const arr = Array.from((input.files || [])).filter(f => /\\.(png|jpg|jpeg|webp)$/i.test(f.name));
+  selectedFiles = arr;
+  document.getElementById("uploadInfo").textContent = `${selectedFiles.length} files selected`;
+}
+
+async function uploadSelected(){
+  if(!selectedFiles.length){ setMsg("No files selected."); return; }
+  let ok = 0, fail = 0;
+  for(const f of selectedFiles){
+    const fd = new FormData();
+    fd.append("file", f);
+    fd.append("category", currentCategory || "all");
+    try{
+      const r = await fetch("/api/menu/upload_image", {method:"POST", headers:apiHeaders(), body:fd});
+      if(r.ok) ok += 1; else fail += 1;
+    }catch(_){ fail += 1; }
+  }
+  await loadCategories();
+  await loadItems();
+  setMsg(`Upload complete. OK=${ok}, Fail=${fail}`, fail===0);
+}
+
+function setupDrop(){
+  const dz = document.getElementById("dropZone");
+  dz.addEventListener("dragover", e => { e.preventDefault(); dz.style.background="#ecfeff"; });
+  dz.addEventListener("dragleave", () => { dz.style.background="#f8fbff"; });
+  dz.addEventListener("drop", e => {
+    e.preventDefault();
+    dz.style.background="#f8fbff";
+    const files = Array.from(e.dataTransfer.files || []).filter(f => /\\.(png|jpg|jpeg|webp)$/i.test(f.name));
+    selectedFiles = files;
+    document.getElementById("uploadInfo").textContent = `${selectedFiles.length} files selected`;
+  });
+}
+
+async function bootstrap(){
+  try{
+    await loadCategories();
+    await loadItems();
+    setMsg("Ready.", true);
+  }catch(e){
+    setMsg(String(e && e.message || e));
+  }
+}
+
+document.getElementById("apiKey").value = localStorage.getItem("gallery_admin_key") || "";
+document.getElementById("filesInput").addEventListener("change", e => pickFilesFromInput(e.target));
+document.getElementById("folderInput").addEventListener("change", e => pickFilesFromInput(e.target));
+setupDrop();
+bootstrap();
 </script>
 </body></html>"""
         from fastapi.responses import HTMLResponse
