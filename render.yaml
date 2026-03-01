@@ -1,0 +1,14 @@
+﻿services:
+  - type: web
+    name: poshub-central-media
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python pos_hub_server.py
+    envVars:
+      - key: POS_HUB_DATA_DIR
+        value: /var/data
+      - key: POS_HUB_PUBLIC_SCHEME
+        value: https
+      - key: POS_HUB_API_KEY
+        sync: false

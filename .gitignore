@@ -1,0 +1,26 @@
+﻿# Runtime data (must be on Render Persistent Disk)
+Data/
+*.db
+*.db-shm
+*.db-wal
+
+# Uploaded/static content
+static/
+menu_images/
+local_server/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS/IDE
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Secrets/local config
+.env
+*.pem
+*.key
