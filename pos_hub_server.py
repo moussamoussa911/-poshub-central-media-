@@ -1,5 +1,5 @@
-"""
-POS Hub (Local LAN Server) — SQLite-backed API for Windows Tkinter POS + Android app.
+﻿"""
+POS Hub (Local LAN Server) â€” SQLite-backed API for Windows Tkinter POS + Android app.
 
 DROP-IN FULL SERVER FILE (CLEANED + FIXED):
 - FIX 1: RTDB catch-all routes (/api/{node}...) moved to the END so they don't steal /api/menu, /api/kv, /api/Pdfs
@@ -74,8 +74,8 @@ def _mask_key(s: str) -> str:
     if not s:
         return "<empty>"
     if len(s) <= 8:
-        return s[0:1] + "…" + s[-1:]
-    return s[:3] + "…" + s[-3:]
+        return s[0:1] + "â€¦" + s[-1:]
+    return s[:3] + "â€¦" + s[-3:]
 
 
 # ------------------------------
@@ -1397,44 +1397,323 @@ def create_app(
     app.state.rate_limit_pdf_window = _env_int("POS_HUB_RATE_LIMIT_PDF_WINDOW_SEC", 60, 1, 3600)
     app.state.max_request_bytes = _env_int("POS_HUB_MAX_REQUEST_BYTES", 15 * 1024 * 1024, 64 * 1024, 1024 * 1024 * 1024)
 
-    # Gallery admin cookie session (simple secure operator login).
-    _gallery_sessions: dict[str, float] = {}
+    # Gallery admin auth/session/user management.
+    _gallery_sessions: dict[str, dict] = {}
     _GALLERY_COOKIE = "gallery_admin_session"
     _GALLERY_TTL_SEC = int(_env_int("POS_HUB_GALLERY_SESSION_TTL_SEC", 12 * 3600, 900, 7 * 24 * 3600))
+    _GALLERY_ROLE_RANK = {"editor": 10, "admin": 20}
+
+    def _gallery_pwd_hash(password: str, salt_hex: Optional[str] = None) -> tuple[str, str]:
+        salt = bytes.fromhex(salt_hex) if (salt_hex and len(str(salt_hex)) >= 16) else os.urandom(16)
+        dk = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt, 200_000)
+        return dk.hex(), salt.hex()
+
+    def _gallery_pwd_verify(password: str, pwd_hash: str, salt_hex: str) -> bool:
+        try:
+            chk, _ = _gallery_pwd_hash(password, salt_hex)
+            return hmac.compare_digest(str(chk), str(pwd_hash or ""))
+        except Exception:
+            return False
+
+    def _gallery_admin_tables_init():
+        con = _connect(db_path)
+        try:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gallery_admin_users (
+                    username TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'editor',
+                    pwd_hash TEXT NOT NULL,
+                    pwd_salt TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_login_at TEXT
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gallery_category_meta (
+                    name TEXT PRIMARY KEY,
+                    sort_order INTEGER NOT NULL DEFAULT 1000,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gallery_brand_info (
+                    id INTEGER PRIMARY KEY CHECK (id=1),
+                    company_name TEXT NOT NULL DEFAULT '',
+                    tagline TEXT NOT NULL DEFAULT '',
+                    logo_url TEXT NOT NULL DEFAULT '',
+                    about_text TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            r = con.execute("SELECT 1 FROM gallery_brand_info WHERE id=1 LIMIT 1").fetchone()
+            if not r:
+                ts = _now()
+                con.execute(
+                    "INSERT INTO gallery_brand_info(id, company_name, tagline, logo_url, about_text, updated_at) VALUES(1,?,?,?,?,?)",
+                    (
+                        str(os.environ.get("POS_HUB_GALLERY_BRAND_NAME", "Company Media Center") or "Company Media Center"),
+                        str(os.environ.get("POS_HUB_GALLERY_BRAND_TAGLINE", "Shared global image manager") or "Shared global image manager"),
+                        str(os.environ.get("POS_HUB_GALLERY_LOGO_URL", "") or ""),
+                        str(os.environ.get("POS_HUB_GALLERY_BRAND_ABOUT", "Manage images, categories and access for your team.") or ""),
+                        ts,
+                    ),
+                )
+            # Bootstrap one admin user.
+            c = con.execute("SELECT COUNT(*) AS n FROM gallery_admin_users").fetchone()
+            existing_users = 0
+            try:
+                if c is not None:
+                    existing_users = int(c["n"] if isinstance(c, sqlite3.Row) else c[0])
+            except Exception:
+                existing_users = 0
+            if existing_users <= 0:
+                u = str(os.environ.get("POS_HUB_GALLERY_ADMIN_USER", "admin") or "admin").strip().lower()
+                p = str(os.environ.get("POS_HUB_GALLERY_ADMIN_PASSWORD", "") or "").strip()
+                if not p:
+                    p = str(api_key or "").strip()
+                    if p:
+                        log.warning("[gallery-admin] POS_HUB_GALLERY_ADMIN_PASSWORD not set; using POS_HUB_API_KEY as initial admin password.")
+                if not p:
+                    p = "ChangeMe123!"
+                    log.warning("[gallery-admin] using fallback initial admin password. Set POS_HUB_GALLERY_ADMIN_PASSWORD.")
+                h, s = _gallery_pwd_hash(p)
+                ts = _now()
+                con.execute(
+                    "INSERT INTO gallery_admin_users(username,display_name,role,pwd_hash,pwd_salt,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (u, "Owner", "admin", h, s, 1, ts, ts),
+                )
+            con.commit()
+        finally:
+            con.close()
+
+    def _gallery_user_get(username: str) -> Optional[dict]:
+        u = str(username or "").strip().lower()
+        if not u:
+            return None
+        con = _connect(db_path)
+        try:
+            r = con.execute(
+                "SELECT username,display_name,role,pwd_hash,pwd_salt,active,last_login_at FROM gallery_admin_users WHERE username=? LIMIT 1",
+                (u,),
+            ).fetchone()
+            return dict(r) if r else None
+        finally:
+            con.close()
+
+    def _gallery_users_list() -> list[dict]:
+        con = _connect(db_path)
+        try:
+            rows = con.execute(
+                "SELECT username,display_name,role,active,created_at,updated_at,last_login_at FROM gallery_admin_users ORDER BY username"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            con.close()
+
+    def _gallery_user_upsert(username: str, display_name: str, role: str, password: Optional[str], active: bool = True):
+        u = str(username or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9._-]{3,40}", u):
+            raise HTTPException(status_code=400, detail="username must match [a-z0-9._-]{3,40}")
+        rr = str(role or "editor").strip().lower()
+        if rr not in ("admin", "editor"):
+            rr = "editor"
+        ts = _now()
+        con = _connect(db_path)
+        try:
+            ex = con.execute("SELECT username,pwd_hash,pwd_salt FROM gallery_admin_users WHERE username=? LIMIT 1", (u,)).fetchone()
+            if ex:
+                pwd_hash = ex["pwd_hash"]
+                pwd_salt = ex["pwd_salt"]
+                if password is not None and str(password).strip():
+                    pwd_hash, pwd_salt = _gallery_pwd_hash(str(password))
+                con.execute(
+                    """
+                    UPDATE gallery_admin_users
+                    SET display_name=?, role=?, pwd_hash=?, pwd_salt=?, active=?, updated_at=?
+                    WHERE username=?
+                    """,
+                    (str(display_name or "").strip(), rr, pwd_hash, pwd_salt, 1 if active else 0, ts, u),
+                )
+            else:
+                if not password or not str(password).strip():
+                    raise HTTPException(status_code=400, detail="password required for new user")
+                h, s = _gallery_pwd_hash(str(password))
+                con.execute(
+                    """
+                    INSERT INTO gallery_admin_users(username,display_name,role,pwd_hash,pwd_salt,active,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (u, str(display_name or "").strip(), rr, h, s, 1 if active else 0, ts, ts),
+                )
+            con.commit()
+        finally:
+            con.close()
+
+    def _gallery_user_delete(username: str):
+        u = str(username or "").strip().lower()
+        con = _connect(db_path)
+        try:
+            c = con.execute("SELECT COUNT(*) FROM gallery_admin_users WHERE role='admin' AND active=1").fetchone()
+            admins = int(c[0] if c else 0)
+            me = con.execute("SELECT role,active FROM gallery_admin_users WHERE username=? LIMIT 1", (u,)).fetchone()
+            if me and str(me["role"] or "") == "admin" and int(me["active"] or 0) == 1 and admins <= 1:
+                raise HTTPException(status_code=400, detail="cannot delete last active admin")
+            con.execute("DELETE FROM gallery_admin_users WHERE username=?", (u,))
+            con.commit()
+        finally:
+            con.close()
+
+    def _gallery_brand_get() -> dict:
+        con = _connect(db_path)
+        try:
+            r = con.execute(
+                "SELECT company_name,tagline,logo_url,about_text,updated_at FROM gallery_brand_info WHERE id=1 LIMIT 1"
+            ).fetchone()
+            return dict(r) if r else {"company_name": "", "tagline": "", "logo_url": "", "about_text": "", "updated_at": ""}
+        finally:
+            con.close()
+
+    def _gallery_brand_set(company_name: str, tagline: str, logo_url: str, about_text: str):
+        con = _connect(db_path)
+        try:
+            con.execute(
+                "UPDATE gallery_brand_info SET company_name=?, tagline=?, logo_url=?, about_text=?, updated_at=? WHERE id=1",
+                (
+                    str(company_name or "").strip(),
+                    str(tagline or "").strip(),
+                    str(logo_url or "").strip(),
+                    str(about_text or "").strip(),
+                    _now(),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _gallery_category_touch(name: str):
+        n = re.sub(r"[^a-z0-9_\-]+", "_", str(name or "").strip().lower()).strip("_")
+        if not n:
+            return
+        con = _connect(db_path)
+        try:
+            ts = _now()
+            mx = con.execute("SELECT COALESCE(MAX(sort_order),0) FROM gallery_category_meta").fetchone()
+            nxt = int(mx[0] if mx and mx[0] is not None else 0) + 10
+            con.execute(
+                """
+                INSERT INTO gallery_category_meta(name,sort_order,created_at,updated_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT(name) DO UPDATE SET updated_at=excluded.updated_at
+                """,
+                (n, nxt, ts, ts),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def _gallery_category_order_map() -> dict:
+        con = _connect(db_path)
+        try:
+            rows = con.execute("SELECT name, sort_order FROM gallery_category_meta").fetchall()
+            out = {}
+            for r in rows:
+                out[str(r["name"])] = int(r["sort_order"] or 1000)
+            return out
+        finally:
+            con.close()
+
+    def _gallery_category_order_set(names: list[str]):
+        con = _connect(db_path)
+        try:
+            ts = _now()
+            order = 10
+            for raw in (names or []):
+                n = re.sub(r"[^a-z0-9_\-]+", "_", str(raw or "").strip().lower()).strip("_")
+                if not n:
+                    continue
+                con.execute(
+                    """
+                    INSERT INTO gallery_category_meta(name,sort_order,created_at,updated_at)
+                    VALUES(?,?,?,?)
+                    ON CONFLICT(name) DO UPDATE SET sort_order=excluded.sort_order, updated_at=excluded.updated_at
+                    """,
+                    (n, order, ts, ts),
+                )
+                order += 10
+            con.commit()
+        finally:
+            con.close()
+
+    _gallery_admin_tables_init()
 
     def _gallery_session_purge(now_ts: Optional[float] = None):
         t = float(now_ts or time.time())
-        dead = [k for k, exp in _gallery_sessions.items() if float(exp or 0.0) <= t]
+        dead = [k for k, v in _gallery_sessions.items() if float((v or {}).get("exp") or 0.0) <= t]
         for k in dead:
             _gallery_sessions.pop(k, None)
 
-    def _gallery_session_issue() -> tuple[str, float]:
+    def _gallery_session_issue(username: str, role: str = "editor", display_name: str = "") -> tuple[str, float]:
         _gallery_session_purge()
         tok = secrets.token_urlsafe(32)
         exp = float(time.time() + _GALLERY_TTL_SEC)
-        _gallery_sessions[tok] = exp
+        _gallery_sessions[tok] = {
+            "exp": exp,
+            "username": str(username or "").strip().lower(),
+            "role": str(role or "editor").strip().lower(),
+            "display_name": str(display_name or "").strip(),
+        }
         return tok, exp
 
-    def _gallery_session_check(request: Request) -> bool:
+    def _gallery_session_check(request: Request) -> Optional[dict]:
         _gallery_session_purge()
         try:
             tok = str(request.cookies.get(_GALLERY_COOKIE) or "").strip()
         except Exception:
             tok = ""
         if not tok:
-            return False
-        exp = float(_gallery_sessions.get(tok) or 0.0)
+            return None
+        row = _gallery_sessions.get(tok) or {}
+        exp = float(row.get("exp") or 0.0)
         if exp <= float(time.time()):
             _gallery_sessions.pop(tok, None)
-            return False
-        return True
+            return None
+        return dict(row)
+
+    def _gallery_require_role(auth_obj: dict, need: str = "editor"):
+        need_rank = int(_GALLERY_ROLE_RANK.get(str(need or "editor"), 10))
+        have_rank = int(_GALLERY_ROLE_RANK.get(str(auth_obj.get("role") or "editor"), 10))
+        if have_rank < need_rank:
+            raise HTTPException(status_code=403, detail="insufficient role")
 
     def _auth_gallery_admin(request: Request, x_api_key: Optional[str]) -> dict:
         # 1) Operator cookie session
-        if _gallery_session_check(request):
-            return {"kind": "gallery_session", "tenant_id": "", "location_id": "", "sub": "gallery-admin"}
+        row = _gallery_session_check(request)
+        if row:
+            return {
+                "kind": "gallery_session",
+                "tenant_id": "",
+                "location_id": "",
+                "sub": str(row.get("username") or "gallery-admin"),
+                "username": str(row.get("username") or ""),
+                "display_name": str(row.get("display_name") or ""),
+                "role": str(row.get("role") or "editor"),
+            }
         # 2) Fallback API key header (for scripts/tools)
-        return _auth(x_api_key)
+        base = _auth(x_api_key)
+        base["username"] = "api_key"
+        base["display_name"] = "API Key"
+        base["role"] = "admin"
+        return base
 
     # Strong warning for deployments that likely lose data on redeploy.
     if str(os.environ.get("RENDER", "")).strip().lower() == "true":
@@ -2780,6 +3059,7 @@ def create_app(
         # Keep menu_images only for backward compatibility with older data.
         cat_raw = str(category or "all").strip().lower()
         cat_safe = re.sub(r"[^a-z0-9_\-]+", "_", cat_raw).strip("_") or "all"
+        _gallery_category_touch(cat_safe)
         gallery_root = Path(POS_HUB_GLOBAL_GALLERY_DIR)
         out_dir = (gallery_root / cat_safe).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2813,52 +3093,75 @@ def create_app(
     def api_gallery_list(
         request: Request,
         category: str = "all",
+        q: str = "",
+        page: int = 1,
+        page_size: int = 120,
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
         _auth_gallery_admin(request, x_api_key)
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         cat = re.sub(r"[^a-z0-9_\-]+", "_", str(category or "all").strip().lower()).strip("_") or "all"
+        qq = str(q or "").strip().lower()
+        page_num = max(1, int(page or 1))
+        ps = min(500, max(10, int(page_size or 120)))
         files = []
         if cat == "all":
-            for p in root.rglob("*"):
-                if not p.is_file():
+            for fp in root.rglob("*"):
+                if not fp.is_file():
                     continue
-                ext = p.suffix.lower()
+                ext = fp.suffix.lower()
                 if ext not in (".png", ".jpg", ".jpeg", ".webp"):
                     continue
-                rel = p.relative_to(root).as_posix()
+                rel = fp.relative_to(root).as_posix()
                 rel_url = f"/static/global_gallery/{rel}"
-                files.append(
-                    {
-                        "name": p.name,
-                        "category": str(p.parent.relative_to(root).as_posix() or "all"),
-                        "rel_path": rel,
-                        "url": _coerce_image_url(request, rel_url),
-                        "size": int(p.stat().st_size if p.exists() else 0),
-                    }
-                )
+                item = {
+                    "name": fp.name,
+                    "category": str(fp.parent.relative_to(root).as_posix() or "all"),
+                    "rel_path": rel,
+                    "url": _coerce_image_url(request, rel_url),
+                    "size": int(fp.stat().st_size if fp.exists() else 0),
+                }
+                if qq and qq not in f"{item['name']} {item['category']}".lower():
+                    continue
+                files.append(item)
         else:
             cat_dir = (root / cat).resolve()
             if cat_dir.exists():
-                for p in cat_dir.glob("*"):
-                    if not p.is_file():
+                for fp in cat_dir.glob("*"):
+                    if not fp.is_file():
                         continue
-                    ext = p.suffix.lower()
+                    ext = fp.suffix.lower()
                     if ext not in (".png", ".jpg", ".jpeg", ".webp"):
                         continue
-                    rel = p.relative_to(root).as_posix()
+                    rel = fp.relative_to(root).as_posix()
                     rel_url = f"/static/global_gallery/{rel}"
-                    files.append(
-                        {
-                            "name": p.name,
-                            "category": cat,
-                            "rel_path": rel,
-                            "url": _coerce_image_url(request, rel_url),
-                            "size": int(p.stat().st_size if p.exists() else 0),
-                        }
-                    )
+                    item = {
+                        "name": fp.name,
+                        "category": cat,
+                        "rel_path": rel,
+                        "url": _coerce_image_url(request, rel_url),
+                        "size": int(fp.stat().st_size if fp.exists() else 0),
+                    }
+                    if qq and qq not in f"{item['name']} {item['category']}".lower():
+                        continue
+                    files.append(item)
         files.sort(key=lambda x: (str(x.get("category") or ""), str(x.get("name") or "")))
-        return {"ok": True, "category": cat, "count": len(files), "items": files}
+        total = len(files)
+        start = (page_num - 1) * ps
+        end = start + ps
+        page_items = files[start:end]
+        total_pages = max(1, (total + ps - 1) // ps)
+        return {
+            "ok": True,
+            "category": cat,
+            "q": qq,
+            "count": len(page_items),
+            "total": total,
+            "page": page_num,
+            "page_size": ps,
+            "total_pages": total_pages,
+            "items": page_items,
+        }
 
     @api.get("/gallery/categories")
     def api_gallery_categories(
@@ -2868,19 +3171,33 @@ def create_app(
         _auth_gallery_admin(request, x_api_key)
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         root.mkdir(parents=True, exist_ok=True)
+        ord_map = _gallery_category_order_map()
         out = []
         for p in root.iterdir():
             if not p.is_dir():
                 continue
             cnt = 0
+            thumb = ""
             for f in p.glob("*"):
                 if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
                     cnt += 1
-            out.append({"name": p.name, "count": cnt})
-        out.sort(key=lambda x: str(x.get("name") or "").lower())
+                    if not thumb:
+                        rel = f.relative_to(root).as_posix()
+                        thumb = _coerce_image_url(request, f"/static/global_gallery/{rel}")
+            out.append(
+                {
+                    "name": p.name,
+                    "count": cnt,
+                    "thumbnail_url": thumb,
+                    "sort_order": int(ord_map.get(str(p.name), 1000)),
+                }
+            )
+            _gallery_category_touch(p.name)
         if not any(str(x.get("name") or "") == "all" for x in out):
-            out.insert(0, {"name": "all", "count": 0})
-        return {"ok": True, "items": out}
+            out.insert(0, {"name": "all", "count": 0, "thumbnail_url": "", "sort_order": 0})
+            _gallery_category_touch("all")
+        out.sort(key=lambda x: (int(x.get("sort_order") or 1000), str(x.get("name") or "").lower()))
+        return {"ok": True, "items": out, "count": len(out)}
 
     @api.post("/gallery/categories")
     def api_gallery_category_create(
@@ -2895,6 +3212,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="invalid category")
         d = (root / cat).resolve()
         d.mkdir(parents=True, exist_ok=True)
+        _gallery_category_touch(cat)
         return {"ok": True, "name": cat}
 
     @api.delete("/gallery/categories")
@@ -2934,6 +3252,20 @@ def create_app(
             pass
         return {"ok": True, "deleted": cat, "moved_to": mv, "moved_count": moved}
 
+    @api.post("/gallery/categories/order")
+    async def api_gallery_category_order(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        a = _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(a, "admin")
+        payload = await _read_payload_any(request)
+        names = payload.get("names") if isinstance(payload, dict) else None
+        if not isinstance(names, list):
+            raise HTTPException(status_code=400, detail="names list required")
+        _gallery_category_order_set([str(x or "") for x in names])
+        return {"ok": True, "count": len(names)}
+
     @api.post("/gallery/move")
     def api_gallery_move(
         request: Request,
@@ -2963,7 +3295,80 @@ def create_app(
             dst = (dst_dir / f"{stem}_{uuid.uuid4().hex[:8]}{ext}").resolve()
         shutil.move(str(src), str(dst))
         new_rel = dst.relative_to(root).as_posix()
+        _gallery_category_touch(cat)
         return {"ok": True, "rel_path": new_rel}
+
+    @api.post("/gallery/rename")
+    def api_gallery_rename(
+        request: Request,
+        rel_path: str = Form(...),
+        new_name: str = Form(...),
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth_gallery_admin(request, x_api_key)
+        root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
+        safe_rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+        if not safe_rel or ".." in safe_rel:
+            raise HTTPException(status_code=400, detail="invalid rel_path")
+        src = (root / safe_rel).resolve()
+        if not str(src).startswith(str(root)) or (not src.exists()) or (not src.is_file()):
+            raise HTTPException(status_code=404, detail="file not found")
+        base = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(new_name or "").strip()).strip("._")
+        if not base:
+            raise HTTPException(status_code=400, detail="invalid new_name")
+        ext = src.suffix
+        if "." in base:
+            bname, bext = os.path.splitext(base)
+            if bext.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+                ext = bext
+                base = bname
+        dst = (src.parent / f"{base}{ext}").resolve()
+        if dst.exists() and str(dst) != str(src):
+            dst = (src.parent / f"{base}_{uuid.uuid4().hex[:8]}{ext}").resolve()
+        src.rename(dst)
+        rel = dst.relative_to(root).as_posix()
+        return {"ok": True, "rel_path": rel, "name": dst.name}
+
+    @api.post("/gallery/replace")
+    async def api_gallery_replace(
+        request: Request,
+        rel_path: str = Form(...),
+        file: UploadFile = File(...),
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth_gallery_admin(request, x_api_key)
+        root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
+        safe_rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+        if not safe_rel or ".." in safe_rel:
+            raise HTTPException(status_code=400, detail="invalid rel_path")
+        dst = (root / safe_rel).resolve()
+        if not str(dst).startswith(str(root)) or (not dst.exists()) or (not dst.is_file()):
+            raise HTTPException(status_code=404, detail="file not found")
+        ext = os.path.splitext(os.path.basename(file.filename or ""))[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+            ext = dst.suffix.lower() or ".png"
+        target = dst
+        if ext != dst.suffix.lower():
+            target = dst.with_suffix(ext)
+        try:
+            with open(target, "wb") as f:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        finally:
+            try:
+                await file.close()
+            except Exception:
+                pass
+        if str(target) != str(dst):
+            try:
+                dst.unlink(missing_ok=True)
+            except Exception:
+                pass
+        rel = target.relative_to(root).as_posix()
+        return {"ok": True, "rel_path": rel}
 
     @api.delete("/gallery/item")
     def api_gallery_delete(
@@ -3047,7 +3452,73 @@ def create_app(
                 moved += 1
             except Exception:
                 failed += 1
+        _gallery_category_touch(cat)
         return {"ok": True, "moved": moved, "failed": failed, "category": cat}
+
+    @api.get("/gallery/brand")
+    def api_gallery_brand_get(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth_gallery_admin(request, x_api_key)
+        return {"ok": True, "brand": _gallery_brand_get()}
+
+    @api.put("/gallery/brand")
+    async def api_gallery_brand_set(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        a = _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(a, "admin")
+        payload = await _read_payload_any(request)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="json object required")
+        _gallery_brand_set(
+            str(payload.get("company_name") or ""),
+            str(payload.get("tagline") or ""),
+            str(payload.get("logo_url") or ""),
+            str(payload.get("about_text") or ""),
+        )
+        return {"ok": True, "brand": _gallery_brand_get()}
+
+    @api.get("/gallery/users")
+    def api_gallery_users_list(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        a = _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(a, "admin")
+        return {"ok": True, "items": _gallery_users_list()}
+
+    @api.post("/gallery/users")
+    async def api_gallery_users_upsert(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        a = _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(a, "admin")
+        payload = await _read_payload_any(request)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="json object required")
+        _gallery_user_upsert(
+            username=str(payload.get("username") or ""),
+            display_name=str(payload.get("display_name") or ""),
+            role=str(payload.get("role") or "editor"),
+            password=(str(payload.get("password")) if payload.get("password") is not None else None),
+            active=bool(payload.get("active", True)),
+        )
+        return {"ok": True}
+
+    @api.delete("/gallery/users/{username}")
+    def api_gallery_users_delete(
+        username: str,
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        a = _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(a, "admin")
+        _gallery_user_delete(username)
+        return {"ok": True}
 
     @api.put("/menu/{item_id}")
     async def api_menu_update(item_id: int, request: Request, x_api_key: Optional[str] = Header(default=None)) -> dict:
@@ -4057,7 +4528,7 @@ def create_app(
         return {"ok": True, "pdf_id": int(pdf_id), "seq": seq}
 
     # ==========================================================
-    # RTDB emulation — Firebase-like merge (Tables)
+    # RTDB emulation â€” Firebase-like merge (Tables)
     # NOTE: Catch-all routes are registered LAST (fixes your 405 on POST /api/menu)
     # ==========================================================
     _NODE_ALIASES = {
@@ -4804,15 +5275,48 @@ def create_app(
     @app.post("/gallery-admin/login")
     async def gallery_admin_login(request: Request):
         payload = await _read_payload_any(request)
+        username = ""
+        password = ""
         raw_key = ""
         if isinstance(payload, dict):
+            username = str(payload.get("username") or "").strip().lower()
+            password = str(payload.get("password") or "").strip()
             raw_key = str(payload.get("api_key") or payload.get("apiKey") or "").strip()
-        if not raw_key:
-            raise HTTPException(status_code=400, detail="api_key required")
-        _auth(raw_key)  # validates against server auth mode/key logic
-        token, exp = _gallery_session_issue()
+        role = "editor"
+        display_name = ""
+        user_for_session = ""
+        if username and password:
+            u = _gallery_user_get(username)
+            if not u or int(u.get("active") or 0) != 1:
+                raise HTTPException(status_code=401, detail="invalid credentials")
+            if not _gallery_pwd_verify(password, str(u.get("pwd_hash") or ""), str(u.get("pwd_salt") or "")):
+                raise HTTPException(status_code=401, detail="invalid credentials")
+            user_for_session = str(u.get("username") or username).strip().lower()
+            display_name = str(u.get("display_name") or "").strip()
+            role = str(u.get("role") or "editor").strip().lower()
+            con = _connect(db_path)
+            try:
+                con.execute(
+                    "UPDATE gallery_admin_users SET last_login_at=?, updated_at=? WHERE username=?",
+                    (_now(), _now(), user_for_session),
+                )
+                con.commit()
+            finally:
+                con.close()
+        elif raw_key:
+            _auth(raw_key)  # recovery/admin fallback
+            user_for_session = "api_key"
+            display_name = "API Key"
+            role = "admin"
+        else:
+            raise HTTPException(status_code=400, detail="username/password or api_key required")
+        token, exp = _gallery_session_issue(user_for_session, role=role, display_name=display_name)
         from fastapi.responses import JSONResponse
-        r = JSONResponse({"ok": True, "expires_at": int(exp)})
+        r = JSONResponse({
+            "ok": True,
+            "expires_at": int(exp),
+            "user": {"username": user_for_session, "display_name": display_name, "role": role},
+        })
         r.set_cookie(
             key=_GALLERY_COOKIE,
             value=token,
@@ -4839,387 +5343,79 @@ def create_app(
 
     @app.get("/gallery-admin/me")
     def gallery_admin_me(request: Request):
-        return {"ok": bool(_gallery_session_check(request))}
-
+        row = _gallery_session_check(request)
+        if not row:
+            return {"ok": False}
+        return {
+            "ok": True,
+            "user": {
+                "username": str(row.get("username") or ""),
+                "display_name": str(row.get("display_name") or ""),
+                "role": str(row.get("role") or "editor"),
+            },
+        }
     @app.get("/gallery-admin")
     def gallery_admin_page():
         html = """<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Global Gallery Admin</title>
-  <style>
-    :root {
-      --bg:#f3f6fb; --card:#ffffff; --line:#dbe3ee; --text:#111827; --muted:#586173;
-      --brand:#0f766e; --danger:#b91c1c; --accent:#0b1220;
-    }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: Segoe UI, Arial, sans-serif; background: var(--bg); color: var(--text); }
-    .wrap { max-width: 1440px; margin: 0 auto; padding: 16px; }
-    .top {
-      background: linear-gradient(140deg, #0b1220 0%, #0f766e 100%);
-      color:#fff; border-radius: 14px; padding:14px; margin-bottom:12px;
-    }
-    .top h1 { margin: 0 0 4px 0; font-size: 20px; }
-    .top p { margin: 0; font-size: 13px; opacity: .95; }
-    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-    .grid-layout { display:grid; grid-template-columns: 300px 1fr; gap:12px; }
-    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; }
-    .title { font-weight:700; margin-bottom:8px; }
-    input, select, button {
-      border-radius:9px; border:1px solid var(--line); padding:8px 10px; font-size: 14px; background:#fff; color:var(--text);
-    }
-    input[type=file] { width: 100%; }
-    button { cursor:pointer; background:var(--accent); color:#fff; border:0; }
-    button.alt { background:#475569; }
-    button.ok { background:var(--brand); }
-    button.danger { background:var(--danger); }
-    .cats { max-height: 360px; overflow:auto; border:1px solid var(--line); border-radius:10px; background:#f8fafc; }
-    .cat-item {
-      display:flex; justify-content:space-between; align-items:center; gap:8px;
-      padding:8px 10px; border-bottom:1px solid #e7edf6; cursor:pointer;
-    }
-    .cat-item:last-child { border-bottom:0; }
-    .cat-item.active { background:#e6fffb; font-weight:700; }
-    .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
-    .drop {
-      border:2px dashed #9fb3ca; border-radius:12px; padding:16px; text-align:center; background:#f8fbff; color:var(--muted);
-      margin-top:8px;
-    }
-    .stats { color:var(--muted); font-size:12px; }
-    .gallery { display:grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap:10px; }
-    .tile { background:#fff; border:1px solid var(--line); border-radius:12px; overflow:hidden; }
-    .img { width:100%; height:160px; object-fit:cover; background:#e6ebf2; }
-    .meta { padding:8px; font-size:12px; }
-    .meta .name { font-size:13px; font-weight:700; margin-bottom:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .meta .small { color:var(--muted); margin-bottom:6px; }
-    .msg { margin:8px 0; font-size:13px; min-height:18px; }
-    @media (max-width: 900px) { .grid-layout { grid-template-columns: 1fr; } }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="top">
-      <h1>Global Gallery Admin</h1>
-      <p>Create categories, upload images or folders, move and delete files for all customers.</p>
-    </div>
-
-    <div class="toolbar card">
-      <div class="row" id="loginRow">
-        <label>Admin Login</label>
-        <input id="apiKey" type="password" style="min-width:320px" placeholder="Enter admin API key once" />
-        <button class="ok" onclick="login()">Sign In</button>
-      </div>
-      <div class="row" id="loggedRow" style="display:none">
-        <span class="stats">Logged in</span>
-        <button class="alt" onclick="bootstrap()">Reload</button>
-        <button class="danger" onclick="logout()">Logout</button>
-        <span class="stats" id="statsTop"></span>
-      </div>
-    </div>
-
-    <div class="grid-layout">
-      <div class="card">
-        <div class="title">Categories</div>
-        <div class="row">
-          <input id="newCat" placeholder="new category" style="flex:1" />
-          <button class="ok" onclick="createCategory()">Create</button>
-        </div>
-        <div class="row" style="margin-top:8px">
-          <button class="danger" onclick="deleteCategory()">Delete Selected</button>
-          <select id="moveToCat"></select>
-        </div>
-        <div class="cats" id="catList" style="margin-top:8px"></div>
-      </div>
-
-      <div>
-        <div class="card" style="margin-bottom:10px">
-          <div class="title">Upload</div>
-          <div class="row">
-            <input id="filesInput" type="file" accept=".png,.jpg,.jpeg,.webp" multiple />
-          </div>
-          <div class="row" style="margin-top:8px">
-            <input id="folderInput" type="file" webkitdirectory directory multiple />
-          </div>
-          <div class="drop" id="dropZone">Drop files here</div>
-          <div class="row" style="margin-top:8px">
-            <button class="ok" onclick="uploadSelected()">Upload Selected</button>
-            <span class="stats" id="uploadInfo">0 files selected</span>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="toolbar">
-            <div class="title" style="margin:0">Images</div>
-            <input id="search" placeholder="search name..." oninput="renderGrid()" />
-            <button onclick="loadItems()">Refresh</button>
-            <button class="alt" onclick="moveSelected()">Move Selected</button>
-            <button class="danger" onclick="deleteSelected()">Delete Selected</button>
-          </div>
-          <div class="msg" id="msg"></div>
-          <div id="gallery" class="gallery"></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
+<html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Company Media Admin</title>
+<style>
+:root{--bg:#f1f5f9;--card:#fff;--line:#d9e2ef;--txt:#0f172a;--muted:#64748b;--brand:#0f766e;--dark:#0b1220;--danger:#b91c1c;}*{box-sizing:border-box}
+body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--txt)}.wrap{max-width:1500px;margin:0 auto;padding:14px}
+.hero{display:flex;gap:14px;align-items:center;padding:14px;border-radius:14px;background:linear-gradient(130deg,#0b1220 0%,#0f766e 100%);color:#fff}
+.logo{width:64px;height:64px;border-radius:12px;object-fit:cover;background:rgba(255,255,255,.2)}.hero h1{margin:0;font-size:22px}.hero p{margin:2px 0 0 0;opacity:.9;font-size:13px}
+.grid{display:grid;grid-template-columns:320px 1fr 340px;gap:12px;margin-top:12px}.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
+.title{font-weight:700;margin-bottom:8px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input,select,textarea,button{border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:14px}textarea{width:100%;min-height:82px;resize:vertical}
+button{cursor:pointer;border:0;background:var(--dark);color:#fff}button.ok{background:var(--brand)}button.alt{background:#475569}button.danger{background:var(--danger)}
+.cats{max-height:360px;overflow:auto;border:1px solid var(--line);border-radius:10px}.cat{padding:8px;border-bottom:1px solid #edf2f7;cursor:pointer;display:flex;align-items:center;gap:8px}.cat:last-child{border-bottom:0}.cat.active{background:#e6fffb}
+.thumb{width:34px;height:34px;border-radius:8px;object-fit:cover;background:#e2e8f0}.drop{border:2px dashed #93a9c7;border-radius:12px;padding:12px;text-align:center;color:var(--muted);background:#f8fbff}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+.tile{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#fff}.img{width:100%;height:160px;object-fit:cover;background:#e2e8f0}.meta{padding:8px;font-size:12px}
+.name{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.small{color:var(--muted)}.msg{min-height:18px;font-size:13px}.muted{color:var(--muted);font-size:12px}.sep{height:1px;background:#eef2f7;margin:10px 0}.hidden{display:none !important}
+@media (max-width:1200px){.grid{grid-template-columns:1fr}}
+</style></head>
+<body><div class="wrap"><div class="hero"><img id="brandLogo" class="logo" src="" alt="logo"><div><h1 id="brandName">Company Media Center</h1><p id="brandTag">Global gallery for all branches and customers</p></div></div>
+<div id="loginCard" class="card" style="margin-top:12px;max-width:520px;"><div class="title">Sign In</div><div class="row"><input id="loginUser" placeholder="Username" style="flex:1" /></div><div class="row" style="margin-top:8px"><input id="loginPass" type="password" placeholder="Password" style="flex:1" /></div><div class="row" style="margin-top:8px"><button class="ok" onclick="loginUserPass()">Login</button></div><div class="muted" style="margin-top:8px">Admin recovery: use API Key login</div><div class="row" style="margin-top:6px"><input id="loginApiKey" type="password" placeholder="API Key (recovery)" style="flex:1" /><button onclick="loginApiKey()">Login with API Key</button></div><div id="loginMsg" class="msg"></div></div>
+<div id="appArea" class="hidden"><div class="toolbar card" style="margin-top:12px;"><span id="who" class="muted"></span><button class="alt" onclick="bootstrap()">Reload</button><button class="danger" onclick="logout()">Logout</button><span id="statsTop" class="muted"></span></div>
+<div class="grid"><div><div class="card"><div class="title">Categories</div><div class="row"><input id="newCat" placeholder="new category" style="flex:1" /><button class="ok" onclick="createCategory()">Create</button></div><div class="row" style="margin-top:8px"><select id="moveToCat" style="flex:1"></select><button class="danger" onclick="deleteCategory()">Delete</button></div><div class="row" style="margin-top:6px"><button class="alt" onclick="moveCategory(-1)">Move Up</button><button class="alt" onclick="moveCategory(1)">Move Down</button></div><div class="cats" id="catList" style="margin-top:8px"></div></div><div class="card" style="margin-top:10px;"><div class="title">Upload</div><input id="filesInput" type="file" accept=".png,.jpg,.jpeg,.webp" multiple /><div style="margin-top:6px"><input id="folderInput" type="file" webkitdirectory directory multiple /></div><div class="drop" id="dropZone" style="margin-top:8px">Drop image files/folders here</div><div class="row" style="margin-top:8px"><button class="ok" onclick="uploadSelected()">Upload Selected</button><span id="uploadInfo" class="muted">0 files selected</span></div></div></div>
+<div class="card"><div class="toolbar"><div class="title" style="margin:0">Images</div><input id="search" placeholder="search..." oninput="loadItems(1)" /><button onclick="loadItems(pageState.page)">Refresh</button><select id="bulkMoveTo"></select><button class="alt" onclick="moveSelected()">Move Selected</button><button class="danger" onclick="deleteSelected()">Delete Selected</button><button class="alt" onclick="selectAllVisible()">Select Page</button><button class="alt" onclick="clearSelection()">Clear</button></div><div id="msg" class="msg"></div><div id="gallery" class="gallery"></div><div class="toolbar" style="margin-top:8px;"><button class="alt" onclick="prevPage()">Prev</button><span id="pager" class="muted"></span><button class="alt" onclick="nextPage()">Next</button><select id="pageSize" onchange="loadItems(1)"><option>60</option><option selected>120</option><option>240</option></select></div></div>
+<div><div class="card"><div class="title">Branding</div><input id="bName" placeholder="Company name" /><div style="margin-top:6px"><input id="bTag" placeholder="Tagline" /></div><div style="margin-top:6px"><input id="bLogo" placeholder="Logo URL (https://...)" /></div><div style="margin-top:6px"><textarea id="bAbout" placeholder="About text"></textarea></div><div class="row"><button class="ok" id="saveBrandBtn" onclick="saveBrand()">Save Branding</button></div></div><div id="usersCard" class="card" style="margin-top:10px;"><div class="title">Team Access</div><div class="row"><input id="uUser" placeholder="username" style="flex:1" /><select id="uRole"><option value="editor">editor</option><option value="admin">admin</option></select></div><div style="margin-top:6px"><input id="uName" placeholder="display name" /></div><div style="margin-top:6px"><input id="uPass" type="password" placeholder="password (new or change)" /></div><div class="row" style="margin-top:6px"><label><input id="uActive" type="checkbox" checked /> active</label><button class="ok" onclick="saveUser()">Save User</button></div><div class="sep"></div><div id="usersList" class="muted"></div></div></div></div></div></div>
 <script>
-let categories = [];
-let items = [];
-let currentCategory = "all";
-let selectedFiles = [];
-let checked = new Set();
-
-async function apiFetch(url, options={}){
-  const opt = Object.assign({}, options || {});
-  opt.credentials = "include";
-  if(opt.body && !(opt.body instanceof FormData)){
-    opt.headers = Object.assign({"Content-Type":"application/json"}, opt.headers || {});
-  }
-  return fetch(url, opt);
-}
-function setMsg(t, ok=false){
-  const m = document.getElementById("msg");
-  m.textContent = t || "";
-  m.style.color = ok ? "#065f46" : "#b91c1c";
-}
-function esc(s){
-  return String(s||"").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-async function login(){
-  const key = document.getElementById("apiKey").value || "";
-  if(!key.trim()){ setMsg("Enter API key."); return; }
-  const r = await apiFetch("/gallery-admin/login", {
-    method:"POST",
-    body: JSON.stringify({api_key:key})
-  });
-  if(!r.ok){ setMsg("Login failed: " + r.status); return; }
-  document.getElementById("apiKey").value = "";
-  await bootstrap();
-}
-async function logout(){
-  await apiFetch("/gallery-admin/logout", {method:"POST"});
-  document.getElementById("loginRow").style.display = "";
-  document.getElementById("loggedRow").style.display = "none";
-  setMsg("Logged out.", true);
-}
-async function authCheck(){
-  const r = await apiFetch("/gallery-admin/me");
-  if(!r.ok) return false;
-  const j = await r.json();
-  return !!(j && j.ok);
-}
-function humanSize(n){
-  let x = Number(n||0);
-  if(x < 1024) return `${x} B`;
-  if(x < 1024*1024) return `${(x/1024).toFixed(1)} KB`;
-  return `${(x/(1024*1024)).toFixed(1)} MB`;
-}
-
-async function loadCategories(){
-  const r = await apiFetch("/api/gallery/categories");
-  if(!r.ok){ throw new Error("categories load failed: "+r.status); }
-  const j = await r.json();
-  categories = Array.isArray(j.items) ? j.items : [];
-  if(!categories.find(x => x.name === currentCategory)){ currentCategory = "all"; }
-
-  const catList = document.getElementById("catList");
-  catList.innerHTML = "";
-  categories.forEach(c => {
-    const row = document.createElement("div");
-    row.className = "cat-item" + (c.name === currentCategory ? " active" : "");
-    row.innerHTML = `<span>${esc(c.name)}</span><span class="stats">${Number(c.count||0)}</span>`;
-    row.onclick = () => { currentCategory = c.name; renderCategories(); loadItems(); };
-    catList.appendChild(row);
-  });
-  renderCategories();
-}
-
-function renderCategories(){
-  const catList = document.getElementById("catList");
-  [...catList.children].forEach((el, idx) => {
-    const c = categories[idx];
-    el.classList.toggle("active", c && c.name === currentCategory);
-  });
-  const moveSel = document.getElementById("moveToCat");
-  moveSel.innerHTML = categories.map(c => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join("");
-  moveSel.value = categories.find(c=>c.name==="all") ? "all" : (categories[0]?.name || "");
-}
-
-async function createCategory(){
-  const raw = document.getElementById("newCat").value || "";
-  if(!raw.trim()){ setMsg("Enter category name."); return; }
-  const fd = new FormData();
-  fd.append("name", raw);
-  const r = await apiFetch("/api/gallery/categories", {method:"POST", body:fd});
-  if(!r.ok){ setMsg("Create category failed: "+r.status); return; }
-  document.getElementById("newCat").value = "";
-  await loadCategories();
-  setMsg("Category created.", true);
-}
-
-async function deleteCategory(){
-  if(currentCategory === "all"){ setMsg("Cannot delete category 'all'."); return; }
-  const moveTo = document.getElementById("moveToCat").value || "all";
-  if(currentCategory === moveTo){ setMsg("Choose different move target."); return; }
-  if(!confirm(`Delete category '${currentCategory}' and move files to '${moveTo}'?`)) return;
-  const r = await apiFetch(`/api/gallery/categories?name=${encodeURIComponent(currentCategory)}&move_to=${encodeURIComponent(moveTo)}`, {
-    method:"DELETE"
-  });
-  if(!r.ok){ setMsg("Delete category failed: "+r.status); return; }
-  currentCategory = "all";
-  await loadCategories();
-  await loadItems();
-  setMsg("Category deleted and files moved.", true);
-}
-
-async function loadItems(){
-  const r = await apiFetch(`/api/gallery/list?category=${encodeURIComponent(currentCategory)}`);
-  if(!r.ok){ setMsg("Load images failed: "+r.status); return; }
-  const j = await r.json();
-  items = Array.isArray(j.items) ? j.items : [];
-  checked = new Set();
-  renderGrid();
-  document.getElementById("statsTop").textContent = `${items.length} images in '${currentCategory}'`;
-}
-
-function renderGrid(){
-  const q = (document.getElementById("search").value || "").toLowerCase().trim();
-  const list = q ? items.filter(it => `${it.name} ${it.category}`.toLowerCase().includes(q)) : items;
-  const root = document.getElementById("gallery");
-  root.innerHTML = "";
-  list.forEach(it => {
-    const id = btoa(it.rel_path).replace(/=/g,"_");
-    const tile = document.createElement("div");
-    tile.className = "tile";
-    tile.innerHTML = `
-      <img class="img" src="${it.url}" loading="lazy" />
-      <div class="meta">
-        <div class="row"><input type="checkbox" id="ck_${id}" onchange="toggleCheck('${esc(it.rel_path)}', this.checked)" /></div>
-        <div class="name" title="${esc(it.name)}">${esc(it.name)}</div>
-        <div class="small">${esc(it.category)} | ${humanSize(it.size)}</div>
-        <div class="row">
-          <input id="mv_${id}" value="${esc(it.category)}" style="flex:1" />
-          <button class="alt" onclick="moveItem('${encodeURIComponent(it.rel_path)}','mv_${id}')">Move</button>
-          <button class="danger" onclick="deleteItem('${encodeURIComponent(it.rel_path)}')">Delete</button>
-        </div>
-      </div>`;
-    root.appendChild(tile);
-  });
-}
-
-async function moveItem(rel, inputId){
-  const nc = document.getElementById(inputId).value || "all";
-  const fd = new FormData();
-  fd.append("rel_path", decodeURIComponent(rel));
-  fd.append("new_category", nc);
-  const r = await apiFetch("/api/gallery/move", {method:"POST", body:fd});
-  if(!r.ok){ setMsg("Move failed: "+r.status); return; }
-  await loadCategories();
-  await loadItems();
-  setMsg("Image moved.", true);
-}
-
-async function deleteItem(rel){
-  if(!confirm("Delete this image?")) return;
-  const r = await apiFetch(`/api/gallery/item?rel_path=${rel}`, {method:"DELETE"});
-  if(!r.ok){ setMsg("Delete failed: "+r.status); return; }
-  await loadCategories();
-  await loadItems();
-  setMsg("Image deleted.", true);
-}
-
-function toggleCheck(rel, on){
-  if(on) checked.add(rel); else checked.delete(rel);
-}
-
-async function deleteSelected(){
-  const arr = Array.from(checked.values());
-  if(!arr.length){ setMsg("No items selected."); return; }
-  if(!confirm(`Delete ${arr.length} selected images?`)) return;
-  const r = await apiFetch("/api/gallery/delete_many", {
-    method:"POST",
-    body: JSON.stringify({rel_paths: arr})
-  });
-  if(!r.ok){ setMsg("Delete selected failed: " + r.status); return; }
-  await loadCategories();
-  await loadItems();
-  setMsg("Selected images deleted.", true);
-}
-
-async function moveSelected(){
-  const arr = Array.from(checked.values());
-  if(!arr.length){ setMsg("No items selected."); return; }
-  const nc = prompt("Move selected to category:", currentCategory || "all");
-  if(nc === null) return;
-  const r = await apiFetch("/api/gallery/move_many", {
-    method:"POST",
-    body: JSON.stringify({rel_paths: arr, new_category: nc})
-  });
-  if(!r.ok){ setMsg("Move selected failed: " + r.status); return; }
-  await loadCategories();
-  await loadItems();
-  setMsg("Selected images moved.", true);
-}
-
-function pickFilesFromInput(input){
-  const arr = Array.from((input.files || [])).filter(f => /\\.(png|jpg|jpeg|webp)$/i.test(f.name));
-  selectedFiles = arr;
-  document.getElementById("uploadInfo").textContent = `${selectedFiles.length} files selected`;
-}
-
-async function uploadSelected(){
-  if(!selectedFiles.length){ setMsg("No files selected."); return; }
-  let ok = 0, fail = 0;
-  for(const f of selectedFiles){
-    const fd = new FormData();
-    fd.append("file", f);
-    fd.append("category", currentCategory || "all");
-    try{
-      const r = await apiFetch("/api/menu/upload_image", {method:"POST", body:fd});
-      if(r.ok) ok += 1; else fail += 1;
-    }catch(_){ fail += 1; }
-  }
-  await loadCategories();
-  await loadItems();
-  setMsg(`Upload complete. OK=${ok}, Fail=${fail}`, fail===0);
-}
-
-function setupDrop(){
-  const dz = document.getElementById("dropZone");
-  dz.addEventListener("dragover", e => { e.preventDefault(); dz.style.background="#ecfeff"; });
-  dz.addEventListener("dragleave", () => { dz.style.background="#f8fbff"; });
-  dz.addEventListener("drop", e => {
-    e.preventDefault();
-    dz.style.background="#f8fbff";
-    const files = Array.from(e.dataTransfer.files || []).filter(f => /\\.(png|jpg|jpeg|webp)$/i.test(f.name));
-    selectedFiles = files;
-    document.getElementById("uploadInfo").textContent = `${selectedFiles.length} files selected`;
-  });
-}
-
-async function bootstrap(){
-  try{
-    const ok = await authCheck();
-    document.getElementById("loginRow").style.display = ok ? "none" : "";
-    document.getElementById("loggedRow").style.display = ok ? "" : "none";
-    if(!ok){
-      setMsg("Please sign in.");
-      return;
-    }
-    await loadCategories();
-    await loadItems();
-    setMsg("Ready.", true);
-  }catch(e){
-    setMsg(String(e && e.message || e));
-  }
-}
-
-document.getElementById("filesInput").addEventListener("change", e => pickFilesFromInput(e.target));
-document.getElementById("folderInput").addEventListener("change", e => pickFilesFromInput(e.target));
-setupDrop();
-bootstrap();
+let categories=[],items=[],currentCategory="all",selectedFiles=[],checked=new Set(),authUser=null;const pageState={page:1,totalPages:1,total:0};
+const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const msg=(t,ok=false)=>{const m=document.getElementById("msg");m.textContent=t||"";m.style.color=ok?"#065f46":"#b91c1c";};
+const loginMsg=(t,ok=false)=>{const m=document.getElementById("loginMsg");m.textContent=t||"";m.style.color=ok?"#065f46":"#b91c1c";};
+const hsize=n=>{n=Number(n||0);if(n<1024)return n+" B";if(n<1048576)return (n/1024).toFixed(1)+" KB";return (n/1048576).toFixed(1)+" MB";};
+async function api(url,opt={}){const o=Object.assign({},opt||{});o.credentials="include";if(o.body&&!(o.body instanceof FormData))o.headers=Object.assign({"Content-Type":"application/json"},o.headers||{});return fetch(url,o);}async function authCheck(){const r=await api("/gallery-admin/me");if(!r.ok)return null;const j=await r.json();return j&&j.ok?j.user:null;}
+async function loginUserPass(){const u=(document.getElementById("loginUser").value||"").trim();const p=(document.getElementById("loginPass").value||"").trim();if(!u||!p){loginMsg("Enter username and password.");return;}const r=await api("/gallery-admin/login",{method:"POST",body:JSON.stringify({username:u,password:p})});if(!r.ok){loginMsg("Login failed: "+r.status);return;}await bootstrap();}
+async function loginApiKey(){const k=(document.getElementById("loginApiKey").value||"").trim();if(!k){loginMsg("Enter api key");return;}const r=await api("/gallery-admin/login",{method:"POST",body:JSON.stringify({api_key:k})});if(!r.ok){loginMsg("API key login failed: "+r.status);return;}await bootstrap();}
+async function logout(){await api("/gallery-admin/logout",{method:"POST"});authUser=null;renderAuth();}
+function renderAuth(){const ok=!!authUser;document.getElementById("loginCard").classList.toggle("hidden",ok);document.getElementById("appArea").classList.toggle("hidden",!ok);if(ok){document.getElementById("who").textContent=`User: ${authUser.username} (${authUser.role})`;document.getElementById("usersCard").classList.toggle("hidden",authUser.role!=="admin");document.getElementById("saveBrandBtn").disabled=(authUser.role!=="admin");}}
+async function loadBrand(){const r=await api("/api/gallery/brand");if(!r.ok)return;const j=await r.json();const b=(j||{}).brand||{};document.getElementById("brandName").textContent=b.company_name||"Company Media Center";document.getElementById("brandTag").textContent=b.tagline||"Global gallery";document.getElementById("brandLogo").src=b.logo_url||"";document.getElementById("bName").value=b.company_name||"";document.getElementById("bTag").value=b.tagline||"";document.getElementById("bLogo").value=b.logo_url||"";document.getElementById("bAbout").value=b.about_text||"";}
+async function saveBrand(){if(!authUser||authUser.role!=="admin")return;const payload={company_name:document.getElementById("bName").value,tagline:document.getElementById("bTag").value,logo_url:document.getElementById("bLogo").value,about_text:document.getElementById("bAbout").value};const r=await api("/api/gallery/brand",{method:"PUT",body:JSON.stringify(payload)});if(!r.ok){msg("Save branding failed: "+r.status);return;}await loadBrand();msg("Branding saved.",true);}
+async function loadUsers(){if(!authUser||authUser.role!=="admin")return;const r=await api("/api/gallery/users");if(!r.ok)return;const j=await r.json();const list=Array.isArray(j.items)?j.items:[];const root=document.getElementById("usersList");root.innerHTML="";list.forEach(u=>{const div=document.createElement("div");div.style.padding="6px 0";div.innerHTML=`<b>${esc(u.username)}</b> (${esc(u.role)}) ${u.active?'<span style="color:#065f46">active</span>':'<span style="color:#b91c1c">inactive</span>'} <button class="alt" onclick="fillUser('${esc(u.username)}','${esc(u.display_name||"")}','${esc(u.role)}',${u.active?1:0})">Edit</button> <button class="danger" onclick="delUser('${esc(u.username)}')">Delete</button>`;root.appendChild(div);});}
+function fillUser(u,n,r,a){document.getElementById("uUser").value=u;document.getElementById("uName").value=n;document.getElementById("uRole").value=r;document.getElementById("uActive").checked=!!a;document.getElementById("uPass").value="";}
+async function saveUser(){if(!authUser||authUser.role!=="admin")return;const p={username:document.getElementById("uUser").value.trim(),display_name:document.getElementById("uName").value.trim(),role:document.getElementById("uRole").value,password:document.getElementById("uPass").value,active:document.getElementById("uActive").checked};if(!p.username){msg("Username required.");return;}const r=await api("/api/gallery/users",{method:"POST",body:JSON.stringify(p)});if(!r.ok){msg("Save user failed: "+r.status);return;}document.getElementById("uPass").value="";await loadUsers();msg("User saved.",true);}async function delUser(u){if(!confirm(`Delete user ${u}?`))return;const r=await api(`/api/gallery/users/${encodeURIComponent(u)}`,{method:"DELETE"});if(!r.ok){msg("Delete user failed: "+r.status);return;}await loadUsers();msg("User deleted.",true);}
+async function loadCategories(){const r=await api("/api/gallery/categories");if(!r.ok){msg("Category load failed: "+r.status);return;}const j=await r.json();categories=Array.isArray(j.items)?j.items:[];if(!categories.find(x=>x.name===currentCategory))currentCategory="all";renderCategories();}
+function renderCategories(){const catList=document.getElementById("catList");catList.innerHTML="";categories.forEach(c=>{const row=document.createElement("div");row.className="cat"+(c.name===currentCategory?" active":"");row.innerHTML=`<img class="thumb" src="${esc(c.thumbnail_url||"")}" /><div style="flex:1"><div>${esc(c.name)}</div><div class="muted">${Number(c.count||0)} images</div></div>`;row.onclick=()=>{currentCategory=c.name;renderCategories();loadItems(1);};catList.appendChild(row);});const opts=categories.map(c=>`<option value="${esc(c.name)}">${esc(c.name)}</option>`).join("");["moveToCat","bulkMoveTo"].forEach(id=>{const el=document.getElementById(id);if(el){el.innerHTML=opts;el.value=currentCategory||"all";}});}async function moveCategory(dir){if(!authUser||authUser.role!=="admin")return;const idx=categories.findIndex(c=>c.name===currentCategory);if(idx<0)return;const ni=idx+dir;if(ni<0||ni>=categories.length)return;const arr=categories.map(c=>c.name);[arr[idx],arr[ni]]=[arr[ni],arr[idx]];const r=await api("/api/gallery/categories/order",{method:"POST",body:JSON.stringify({names:arr})});if(!r.ok){msg("Reorder failed: "+r.status);return;}await loadCategories();msg("Category order updated.",true);} 
+async function createCategory(){const raw=document.getElementById("newCat").value||"";if(!raw.trim()){msg("Enter category name.");return;}const fd=new FormData();fd.append("name",raw);const r=await api("/api/gallery/categories",{method:"POST",body:fd});if(!r.ok){msg("Create category failed: "+r.status);return;}document.getElementById("newCat").value="";await loadCategories();msg("Category created.",true);} 
+async function deleteCategory(){if(currentCategory==="all"){msg("Cannot delete 'all'.");return;}const moveTo=document.getElementById("moveToCat").value||"all";if(moveTo===currentCategory){msg("Select another target.");return;}if(!confirm(`Delete '${currentCategory}' and move files to '${moveTo}'?`))return;const r=await api(`/api/gallery/categories?name=${encodeURIComponent(currentCategory)}&move_to=${encodeURIComponent(moveTo)}`,{method:"DELETE"});if(!r.ok){msg("Delete category failed: "+r.status);return;}currentCategory="all";await loadCategories();await loadItems(1);msg("Category deleted.",true);} 
+async function loadItems(page=1){const q=(document.getElementById("search").value||"").trim();const ps=Number(document.getElementById("pageSize").value||120);const u=`/api/gallery/list?category=${encodeURIComponent(currentCategory)}&q=${encodeURIComponent(q)}&page=${page}&page_size=${ps}`;const r=await api(u);if(!r.ok){msg("Load images failed: "+r.status);return;}const j=await r.json();items=Array.isArray(j.items)?j.items:[];pageState.page=Number(j.page||1);pageState.totalPages=Number(j.total_pages||1);pageState.total=Number(j.total||0);checked=new Set();renderGrid();document.getElementById("pager").textContent=`Page ${pageState.page}/${pageState.totalPages} (${pageState.total} total)`;document.getElementById("statsTop").textContent=`${pageState.total} images in '${currentCategory}'`;}
+function prevPage(){if(pageState.page>1)loadItems(pageState.page-1);} function nextPage(){if(pageState.page<pageState.totalPages)loadItems(pageState.page+1);} function categoryOptionsHtml(sel){return categories.map(c=>`<option value="${esc(c.name)}"${c.name===sel?" selected":""}>${esc(c.name)}</option>`).join("");}
+function toggleCheck(rel,on){if(on)checked.add(rel);else checked.delete(rel);} function selectAllVisible(){items.forEach(it=>checked.add(it.rel_path));renderGrid();msg(`${items.length} selected`,true);} function clearSelection(){checked=new Set();renderGrid();msg("Selection cleared.",true);} 
+function renderGrid(){const root=document.getElementById("gallery");root.innerHTML="";items.forEach(it=>{const id=btoa(it.rel_path).replace(/=/g,"_");const tile=document.createElement("div");tile.className="tile";tile.innerHTML=`<img class="img" src="${it.url}" loading="lazy" /><div class="meta"><div class="row"><input type="checkbox" ${checked.has(it.rel_path)?"checked":""} onchange="toggleCheck('${esc(it.rel_path)}',this.checked)" /></div><div class="name">${esc(it.name)}</div><div class="small">${esc(it.category)} | ${hsize(it.size)}</div><div class="row"><select id="mv_${id}" style="flex:1">${categoryOptionsHtml(it.category)}</select><button class="alt" onclick="moveItem('${encodeURIComponent(it.rel_path)}','mv_${id}')">Move</button></div><div class="row" style="margin-top:6px"><input id="rn_${id}" placeholder="new name" style="flex:1" /><button class="alt" onclick="renameItem('${encodeURIComponent(it.rel_path)}','rn_${id}')">Rename</button></div><div class="row" style="margin-top:6px"><input id="rp_${id}" type="file" accept=".png,.jpg,.jpeg,.webp" style="flex:1" /><button class="alt" onclick="replaceItem('${encodeURIComponent(it.rel_path)}','rp_${id}')">Replace</button><button class="danger" onclick="deleteItem('${encodeURIComponent(it.rel_path)}')">Delete</button></div></div>`;root.appendChild(tile);});}
+async function moveItem(rel,inputId){const nc=document.getElementById(inputId).value||"all";const fd=new FormData();fd.append("rel_path",decodeURIComponent(rel));fd.append("new_category",nc);const r=await api("/api/gallery/move",{method:"POST",body:fd});if(!r.ok){msg("Move failed: "+r.status);return;}await loadCategories();await loadItems(pageState.page);msg("Moved.",true);} 
+async function moveSelected(){const arr=Array.from(checked.values());if(!arr.length){msg("No selection.");return;}const nc=document.getElementById("bulkMoveTo").value||"all";const r=await api("/api/gallery/move_many",{method:"POST",body:JSON.stringify({rel_paths:arr,new_category:nc})});if(!r.ok){msg("Batch move failed: "+r.status);return;}await loadCategories();await loadItems(pageState.page);msg("Batch move done.",true);} 
+async function deleteItem(rel){if(!confirm("Delete image?"))return;const r=await api(`/api/gallery/item?rel_path=${rel}`,{method:"DELETE"});if(!r.ok){msg("Delete failed: "+r.status);return;}await loadCategories();await loadItems(pageState.page);msg("Deleted.",true);} 
+async function deleteSelected(){const arr=Array.from(checked.values());if(!arr.length){msg("No selection.");return;}if(!confirm(`Delete ${arr.length} images?`))return;const r=await api("/api/gallery/delete_many",{method:"POST",body:JSON.stringify({rel_paths:arr})});if(!r.ok){msg("Batch delete failed: "+r.status);return;}await loadCategories();await loadItems(pageState.page);msg("Batch delete done.",true);} 
+async function renameItem(rel,id){const nv=(document.getElementById(id).value||"").trim();if(!nv){msg("Enter new name.");return;}const fd=new FormData();fd.append("rel_path",decodeURIComponent(rel));fd.append("new_name",nv);const r=await api("/api/gallery/rename",{method:"POST",body:fd});if(!r.ok){msg("Rename failed: "+r.status);return;}await loadItems(pageState.page);msg("Renamed.",true);} 
+async function replaceItem(rel,id){const el=document.getElementById(id);if(!el||!el.files||!el.files[0]){msg("Choose replacement file.");return;}const fd=new FormData();fd.append("rel_path",decodeURIComponent(rel));fd.append("file",el.files[0]);const r=await api("/api/gallery/replace",{method:"POST",body:fd});if(!r.ok){msg("Replace failed: "+r.status);return;}await loadItems(pageState.page);msg("Replaced.",true);} 
+function pickFilesFromInput(input){selectedFiles=Array.from((input.files||[])).filter(f=>/\.(png|jpg|jpeg|webp)$/i.test(f.name));document.getElementById("uploadInfo").textContent=`${selectedFiles.length} files selected`;}
+async function uploadSelected(){if(!selectedFiles.length){msg("No files selected.");return;}let ok=0,fail=0;for(const f of selectedFiles){const fd=new FormData();fd.append("file",f);fd.append("category",currentCategory||"all");try{const r=await api("/api/menu/upload_image",{method:"POST",body:fd});if(r.ok)ok++;else fail++;}catch(_){fail++;}}await loadCategories();await loadItems(pageState.page);msg(`Upload complete OK=${ok}, Fail=${fail}`,fail===0);} 
+function setupDrop(){const dz=document.getElementById("dropZone");dz.addEventListener("dragover",e=>{e.preventDefault();dz.style.background="#ecfeff";});dz.addEventListener("dragleave",()=>{dz.style.background="#f8fbff";});dz.addEventListener("drop",e=>{e.preventDefault();dz.style.background="#f8fbff";selectedFiles=Array.from(e.dataTransfer.files||[]).filter(f=>/\.(png|jpg|jpeg|webp)$/i.test(f.name));document.getElementById("uploadInfo").textContent=`${selectedFiles.length} files selected`;});}
+async function bootstrap(){authUser=await authCheck();renderAuth();if(!authUser)return;await loadBrand();await loadCategories();await loadItems(1);if(authUser.role==="admin")await loadUsers();msg("Ready.",true);} 
+document.getElementById("filesInput").addEventListener("change",e=>pickFilesFromInput(e.target));document.getElementById("folderInput").addEventListener("change",e=>pickFilesFromInput(e.target));setupDrop();bootstrap();
 </script>
 </body></html>"""
         from fastapi.responses import HTMLResponse
@@ -6122,7 +6318,7 @@ bootstrap();
         if not typed:
             return False
 
-        _arabic_digits = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+        _arabic_digits = str.maketrans("Ù Ù¡Ù¢Ù£Ù¤Ù¥Ù¦Ù§Ù¨Ù©", "0123456789")
 
         def _norm_pin_text(s: str) -> str:
             return str(s or "").strip().translate(_arabic_digits)
@@ -6942,3 +7138,4 @@ if __name__ == "__main__":
         uvicorn.run(app, host="0.0.0.0", port=_PUBLIC_PORT, ssl_certfile=_cert, ssl_keyfile=_key, log_level="info")
     else:
         uvicorn.run(app, host="0.0.0.0", port=_PUBLIC_PORT, log_level="info")
+
