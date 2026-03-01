@@ -205,6 +205,8 @@ def _ensure_dirs(data_dir: Path) -> dict[str, Path]:
 
     static_dir = data_dir / "static"
     menu_img_dir = static_dir / "menu_images"
+    # New global shared gallery folder (cross-customer media base).
+    global_gallery_dir = static_dir / "global_gallery"
 
     local_server_dir = data_dir / "local_server"
     pdf_in_dir = local_server_dir / "pdfs_in"
@@ -212,6 +214,7 @@ def _ensure_dirs(data_dir: Path) -> dict[str, Path]:
 
     static_dir.mkdir(parents=True, exist_ok=True)
     menu_img_dir.mkdir(parents=True, exist_ok=True)
+    global_gallery_dir.mkdir(parents=True, exist_ok=True)
     local_server_dir.mkdir(parents=True, exist_ok=True)
     pdf_in_dir.mkdir(parents=True, exist_ok=True)
     pdf_done_dir.mkdir(parents=True, exist_ok=True)
@@ -220,6 +223,7 @@ def _ensure_dirs(data_dir: Path) -> dict[str, Path]:
         "DATA_DIR": data_dir,
         "STATIC_DIR": static_dir,
         "MENU_IMG_DIR": menu_img_dir,
+        "GLOBAL_GALLERY_DIR": global_gallery_dir,
         "LOCAL_SERVER_DIR": local_server_dir,
         "PDF_IN_DIR": pdf_in_dir,
         "PDF_DONE_DIR": pdf_done_dir,
@@ -255,6 +259,7 @@ DEFAULT_DIRS = _ensure_dirs(_default_data_dir())
 POS_HUB_DATA_DIR = DEFAULT_DIRS["DATA_DIR"]
 POS_HUB_STATIC_DIR = DEFAULT_DIRS["STATIC_DIR"]
 POS_HUB_MENU_IMG_DIR = DEFAULT_DIRS["MENU_IMG_DIR"]
+POS_HUB_GLOBAL_GALLERY_DIR = DEFAULT_DIRS["GLOBAL_GALLERY_DIR"]
 
 
 # ------------------------------
@@ -1473,7 +1478,7 @@ def create_app(
                 base = _request_base(request)["request_base"].rstrip("/")
                 return f"{base}/static/{tail}"
 
-        if s2.startswith("menu_images/"):
+        if s2.startswith("menu_images/") or s2.startswith("global_gallery/"):
             tail = s2
             try:
                 return str(request.url_for("static", path=tail))
@@ -1483,10 +1488,10 @@ def create_app(
 
         filename = os.path.basename(s2)
         try:
-            return str(request.url_for("static", path=f"menu_images/{filename}"))
+            return str(request.url_for("static", path=f"global_gallery/{filename}"))
         except Exception:
             base = _request_base(request)["request_base"].rstrip("/")
-            return f"{base}/static/menu_images/{filename}"
+            return f"{base}/static/global_gallery/{filename}"
 
     def _force_http_static_url(request: Request, url: str) -> str:
         s = (url or "").strip()
@@ -2721,6 +2726,7 @@ def create_app(
     async def api_menu_upload_image(
         request: Request,
         file: UploadFile = File(...),
+        category: str = Form("all"),
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
         _auth(x_api_key)
@@ -2730,10 +2736,15 @@ def create_app(
         if ext not in (".png", ".jpg", ".jpeg", ".webp"):
             ext = ".png"
 
-        menu_img_dir = Path(POS_HUB_MENU_IMG_DIR)
-        menu_img_dir.mkdir(parents=True, exist_ok=True)
+        # Store all shared media in global_gallery/<category>/...
+        # Keep menu_images only for backward compatibility with older data.
+        cat_raw = str(category or "all").strip().lower()
+        cat_safe = re.sub(r"[^a-z0-9_\-]+", "_", cat_raw).strip("_") or "all"
+        gallery_root = Path(POS_HUB_GLOBAL_GALLERY_DIR)
+        out_dir = (gallery_root / cat_safe).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
         out_name = f"{uuid.uuid4().hex}{ext}"
-        out_path = (menu_img_dir / out_name).resolve()
+        out_path = (out_dir / out_name).resolve()
 
         try:
             with open(out_path, "wb") as f:
@@ -2748,9 +2759,114 @@ def create_app(
             except Exception:
                 pass
 
-        rel_url = f"/static/menu_images/{out_name}"
+        rel_url = f"/static/global_gallery/{cat_safe}/{out_name}"
         abs_url = _coerce_image_url(request, rel_url)
-        return {"ok": True, "filename": out_name, "image_url": abs_url, "image_url_rel": rel_url}
+        return {
+            "ok": True,
+            "filename": out_name,
+            "category": cat_safe,
+            "image_url": abs_url,
+            "image_url_rel": rel_url,
+        }
+
+    @api.get("/gallery/list")
+    def api_gallery_list(
+        request: Request,
+        category: str = "all",
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth(x_api_key)
+        root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
+        cat = re.sub(r"[^a-z0-9_\-]+", "_", str(category or "all").strip().lower()).strip("_") or "all"
+        files = []
+        if cat == "all":
+            for p in root.rglob("*"):
+                if not p.is_file():
+                    continue
+                ext = p.suffix.lower()
+                if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+                    continue
+                rel = p.relative_to(root).as_posix()
+                rel_url = f"/static/global_gallery/{rel}"
+                files.append(
+                    {
+                        "name": p.name,
+                        "category": str(p.parent.relative_to(root).as_posix() or "all"),
+                        "rel_path": rel,
+                        "url": _coerce_image_url(request, rel_url),
+                        "size": int(p.stat().st_size if p.exists() else 0),
+                    }
+                )
+        else:
+            cat_dir = (root / cat).resolve()
+            if cat_dir.exists():
+                for p in cat_dir.glob("*"):
+                    if not p.is_file():
+                        continue
+                    ext = p.suffix.lower()
+                    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+                        continue
+                    rel = p.relative_to(root).as_posix()
+                    rel_url = f"/static/global_gallery/{rel}"
+                    files.append(
+                        {
+                            "name": p.name,
+                            "category": cat,
+                            "rel_path": rel,
+                            "url": _coerce_image_url(request, rel_url),
+                            "size": int(p.stat().st_size if p.exists() else 0),
+                        }
+                    )
+        files.sort(key=lambda x: (str(x.get("category") or ""), str(x.get("name") or "")))
+        return {"ok": True, "category": cat, "count": len(files), "items": files}
+
+    @api.post("/gallery/move")
+    def api_gallery_move(
+        rel_path: str = Form(...),
+        new_category: str = Form(...),
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth(x_api_key)
+        root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
+        safe_rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+        if not safe_rel or ".." in safe_rel:
+            raise HTTPException(status_code=400, detail="invalid rel_path")
+        src = (root / safe_rel).resolve()
+        if not str(src).startswith(str(root)):
+            raise HTTPException(status_code=400, detail="invalid rel_path")
+        if not src.exists() or not src.is_file():
+            raise HTTPException(status_code=404, detail="file not found")
+        cat = re.sub(r"[^a-z0-9_\-]+", "_", str(new_category or "all").strip().lower()).strip("_") or "all"
+        dst_dir = (root / cat).resolve()
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = (dst_dir / src.name).resolve()
+        if str(dst) == str(src):
+            return {"ok": True, "rel_path": safe_rel}
+        if dst.exists():
+            stem = src.stem
+            ext = src.suffix
+            dst = (dst_dir / f"{stem}_{uuid.uuid4().hex[:8]}{ext}").resolve()
+        shutil.move(str(src), str(dst))
+        new_rel = dst.relative_to(root).as_posix()
+        return {"ok": True, "rel_path": new_rel}
+
+    @api.delete("/gallery/item")
+    def api_gallery_delete(
+        rel_path: str,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth(x_api_key)
+        root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
+        safe_rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+        if not safe_rel or ".." in safe_rel:
+            raise HTTPException(status_code=400, detail="invalid rel_path")
+        p = (root / safe_rel).resolve()
+        if not str(p).startswith(str(root)):
+            raise HTTPException(status_code=400, detail="invalid rel_path")
+        if not p.exists() or not p.is_file():
+            raise HTTPException(status_code=404, detail="file not found")
+        p.unlink(missing_ok=False)
+        return {"ok": True}
 
     @api.put("/menu/{item_id}")
     async def api_menu_update(item_id: int, request: Request, x_api_key: Optional[str] = Header(default=None)) -> dict:
@@ -4504,6 +4620,103 @@ def create_app(
     # Register /api routes now
     app.include_router(api)
 
+    @app.get("/gallery-admin")
+    def gallery_admin_page():
+        html = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Global Gallery Admin</title>
+  <style>
+    body { font-family: Segoe UI, Arial, sans-serif; margin: 16px; background: #f5f7fb; color: #111827; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    input, select, button { padding: 8px; border: 1px solid #d1d5db; border-radius: 8px; }
+    button { cursor: pointer; background: #111827; color: #fff; border: 0; }
+    button.alt { background: #4b5563; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; }
+    .img { width: 100%; height: 150px; object-fit: cover; background: #e5e7eb; }
+    .meta { padding: 8px; font-size: 12px; }
+    .meta .name { font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h2>Global Gallery Admin</h2>
+  <div class="row">
+    <label>API Key:</label>
+    <input id="key" type="password" style="min-width:260px" />
+    <label>Category:</label>
+    <input id="cat" value="all" />
+    <button onclick="loadList()">Load</button>
+  </div>
+  <div class="row">
+    <input id="file" type="file" accept=".png,.jpg,.jpeg,.webp" />
+    <button onclick="upload()">Upload</button>
+  </div>
+  <div id="msg" style="margin:8px 0;color:#b91c1c"></div>
+  <div id="grid" class="grid"></div>
+<script>
+function h(k){ return {"X-Api-Key": document.getElementById("key").value || ""}; }
+function msg(t,c){ const m=document.getElementById("msg"); m.style.color=c||"#b91c1c"; m.textContent=t||""; }
+async function loadList(){
+  msg("");
+  const cat = encodeURIComponent(document.getElementById("cat").value || "all");
+  const r = await fetch(`/api/gallery/list?category=${cat}`, {headers:h()});
+  if(!r.ok){ msg("Load failed: "+r.status); return; }
+  const j = await r.json();
+  const grid = document.getElementById("grid");
+  grid.innerHTML = "";
+  (j.items||[]).forEach(it=>{
+    const el = document.createElement("div");
+    el.className = "card";
+    el.innerHTML = `
+      <img class="img" src="${it.url}" />
+      <div class="meta">
+        <div class="name">${it.name}</div>
+        <div>Category: ${it.category}</div>
+        <div class="row" style="margin-top:6px">
+          <input value="${it.category}" id="mv_${btoa(it.rel_path).replace(/=/g,'_')}" />
+          <button class="alt" onclick="moveItem('${encodeURIComponent(it.rel_path)}','mv_${btoa(it.rel_path).replace(/=/g,'_')}')">Move</button>
+          <button onclick="delItem('${encodeURIComponent(it.rel_path)}')">Delete</button>
+        </div>
+      </div>`;
+    grid.appendChild(el);
+  });
+  msg(`Loaded ${j.count} images`, "#065f46");
+}
+async function upload(){
+  msg("");
+  const f = document.getElementById("file").files[0];
+  if(!f){ msg("Select file first"); return; }
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("category", document.getElementById("cat").value || "all");
+  const r = await fetch("/api/menu/upload_image", {method:"POST", headers:h(), body:fd});
+  if(!r.ok){ msg("Upload failed: "+r.status); return; }
+  msg("Upload OK", "#065f46");
+  await loadList();
+}
+async function delItem(rel){
+  if(!confirm("Delete image?")) return;
+  const r = await fetch(`/api/gallery/item?rel_path=${rel}`, {method:"DELETE", headers:h()});
+  if(!r.ok){ msg("Delete failed: "+r.status); return; }
+  await loadList();
+}
+async function moveItem(rel, id){
+  const nc = document.getElementById(id).value || "all";
+  const fd = new FormData();
+  fd.append("rel_path", decodeURIComponent(rel));
+  fd.append("new_category", nc);
+  const r = await fetch("/api/gallery/move", {method:"POST", headers:h(), body:fd});
+  if(!r.ok){ msg("Move failed: "+r.status); return; }
+  await loadList();
+}
+</script>
+</body></html>"""
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(content=html)
+
     # ---- Health ----
     @app.get("/health")
     def health(request: Request) -> dict:
@@ -4522,6 +4735,7 @@ def create_app(
             "data_dir": str(dirs["DATA_DIR"]),
             "static_dir": str(dirs["STATIC_DIR"]),
             "menu_img_dir": str(dirs["MENU_IMG_DIR"]),
+            "global_gallery_dir": str(dirs["GLOBAL_GALLERY_DIR"]),
             "local_server_dir": str(dirs["LOCAL_SERVER_DIR"]),
             "pdf_in_dir": str(dirs["PDF_IN_DIR"]),
             "pdf_done_dir": str(dirs["PDF_DONE_DIR"]),

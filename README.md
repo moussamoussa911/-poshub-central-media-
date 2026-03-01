@@ -20,12 +20,14 @@ Central POS-Hub backend for shared menu image gallery across all customers.
 5. Attach a **Persistent Disk** mounted at `/var/data`.
 
 ## What is stored on disk
-- `/var/data/static/menu_images` (uploaded images)
+- `/var/data/static/global_gallery` (uploaded shared gallery images)
+- `/var/data/static/menu_images` (legacy/backward-compat path)
 - `/var/data/*.db` (SQLite data)
 
 ## URL examples
 - Health: `https://<service>.onrender.com/health`
-- Static image: `https://<service>.onrender.com/static/menu_images/<file>`
+- Static image: `https://<service>.onrender.com/static/global_gallery/<category>/<file>`
+- Admin GUI: `https://<service>.onrender.com/gallery-admin` (upload/move/delete with API key)
 
 ## Important
 All customers must use the same `online_url` (this Render service URL) to share one gallery.
