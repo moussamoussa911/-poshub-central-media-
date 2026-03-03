@@ -1455,6 +1455,30 @@ def create_app(
                 )
                 """
             )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gallery_image_stats (
+                    rel_path TEXT PRIMARY KEY,
+                    selected_count INTEGER NOT NULL DEFAULT 0,
+                    downloaded_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    last_selected_at TEXT,
+                    last_downloaded_at TEXT
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gallery_media_index (
+                    rel_path TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    file_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            con.execute("CREATE INDEX IF NOT EXISTS idx_gallery_media_hash ON gallery_media_index(category, file_hash)")
             r = con.execute("SELECT 1 FROM gallery_brand_info WHERE id=1 LIMIT 1").fetchone()
             if not r:
                 ts = _now()
@@ -1650,6 +1674,113 @@ def create_app(
                     (n, order, ts, ts),
                 )
                 order += 10
+            con.commit()
+        finally:
+            con.close()
+
+    def _gallery_stats_touch(rel_path: str, metric: str):
+        rp = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+        if not rp:
+            return
+        ts = _now()
+        con = _connect(db_path)
+        try:
+            con.execute(
+                """
+                INSERT INTO gallery_image_stats(rel_path, selected_count, downloaded_count, updated_at, last_selected_at, last_downloaded_at)
+                VALUES(?,0,0,?,?,?)
+                ON CONFLICT(rel_path) DO UPDATE SET updated_at=excluded.updated_at
+                """,
+                (rp, ts, None, None),
+            )
+            if metric == "selected":
+                con.execute(
+                    """
+                    UPDATE gallery_image_stats
+                    SET selected_count = selected_count + 1, updated_at=?, last_selected_at=?
+                    WHERE rel_path=?
+                    """,
+                    (ts, ts, rp),
+                )
+            elif metric == "downloaded":
+                con.execute(
+                    """
+                    UPDATE gallery_image_stats
+                    SET downloaded_count = downloaded_count + 1, updated_at=?, last_downloaded_at=?
+                    WHERE rel_path=?
+                    """,
+                    (ts, ts, rp),
+                )
+            con.commit()
+        finally:
+            con.close()
+
+    def _gallery_stats_get_map(rel_paths: list[str]) -> dict:
+        out = {}
+        keys = [str(x or "").strip().replace("\\", "/").lstrip("/") for x in (rel_paths or []) if str(x or "").strip()]
+        if not keys:
+            return out
+        con = _connect(db_path)
+        try:
+            qmarks = ",".join(["?"] * len(keys))
+            rows = con.execute(
+                f"SELECT rel_path, selected_count, downloaded_count FROM gallery_image_stats WHERE rel_path IN ({qmarks})",
+                tuple(keys),
+            ).fetchall()
+            for r in rows:
+                out[str(r["rel_path"])] = {
+                    "selected_count": int(r["selected_count"] or 0),
+                    "downloaded_count": int(r["downloaded_count"] or 0),
+                }
+        finally:
+            con.close()
+        return out
+
+    def _gallery_stats_move_rel(old_rel: str, new_rel: str):
+        oldp = str(old_rel or "").strip().replace("\\", "/").lstrip("/")
+        newp = str(new_rel or "").strip().replace("\\", "/").lstrip("/")
+        if (not oldp) or (not newp) or oldp == newp:
+            return
+        con = _connect(db_path)
+        try:
+            con.execute("UPDATE gallery_image_stats SET rel_path=?, updated_at=? WHERE rel_path=?", (newp, _now(), oldp))
+            con.execute("UPDATE gallery_media_index SET rel_path=?, updated_at=? WHERE rel_path=?", (newp, _now(), oldp))
+            con.commit()
+        finally:
+            con.close()
+
+    def _gallery_media_find_by_hash(category: str, file_hash: str) -> str:
+        cat = re.sub(r"[^a-z0-9_\\-]+", "_", str(category or "").strip().lower()).strip("_") or "all"
+        fh = str(file_hash or "").strip().lower()
+        if not fh:
+            return ""
+        con = _connect(db_path)
+        try:
+            r = con.execute(
+                "SELECT rel_path FROM gallery_media_index WHERE category=? AND file_hash=? LIMIT 1",
+                (cat, fh),
+            ).fetchone()
+            return str(r["rel_path"] if r else "").strip()
+        finally:
+            con.close()
+
+    def _gallery_media_upsert(rel_path: str, category: str, file_hash: str):
+        rp = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+        cat = re.sub(r"[^a-z0-9_\\-]+", "_", str(category or "").strip().lower()).strip("_") or "all"
+        fh = str(file_hash or "").strip().lower()
+        if not rp:
+            return
+        con = _connect(db_path)
+        try:
+            ts = _now()
+            con.execute(
+                """
+                INSERT INTO gallery_media_index(rel_path,category,file_hash,created_at,updated_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(rel_path) DO UPDATE SET category=excluded.category,file_hash=excluded.file_hash,updated_at=excluded.updated_at
+                """,
+                (rp, cat, fh, ts, ts),
+            )
             con.commit()
         finally:
             con.close()
@@ -1921,6 +2052,17 @@ def create_app(
         auth_tok = _AUTH_CTX.set(None)
         try:
             response = await call_next(request)
+            try:
+                # Track real image downloads from static global gallery.
+                if method == "GET" and int(getattr(response, "status_code", 0) or 0) == 200:
+                    pth = str(path or "")
+                    prefix = "/static/global_gallery/"
+                    if pth.startswith(prefix):
+                        rel = pth[len(prefix):].lstrip("/")
+                        if rel:
+                            _gallery_stats_touch(rel, "downloaded")
+            except Exception:
+                pass
             _ = int((time.perf_counter() - t0) * 1000)
             return response
         except Exception:
@@ -3065,21 +3207,49 @@ def create_app(
         out_dir.mkdir(parents=True, exist_ok=True)
         out_name = f"{uuid.uuid4().hex}{ext}"
         out_path = (out_dir / out_name).resolve()
+        tmp_path = (out_dir / f".__tmp_{uuid.uuid4().hex}{ext}").resolve()
+        hasher = hashlib.sha1()
 
         try:
-            with open(out_path, "wb") as f:
+            with open(tmp_path, "wb") as f:
                 while True:
                     chunk = await file.read(1024 * 1024)
                     if not chunk:
                         break
                     f.write(chunk)
+                    hasher.update(chunk)
         finally:
             try:
                 await file.close()
             except Exception:
                 pass
 
+        file_hash = hasher.hexdigest().lower()
+        existing_rel = _gallery_media_find_by_hash(cat_safe, file_hash)
+        if existing_rel:
+            existing_abs = (gallery_root / existing_rel).resolve()
+            if existing_abs.exists() and existing_abs.is_file():
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                rel_url_exist = f"/static/global_gallery/{existing_rel}"
+                return {
+                    "ok": True,
+                    "duplicate": True,
+                    "filename": os.path.basename(existing_rel),
+                    "category": cat_safe,
+                    "image_url": _coerce_image_url(request, rel_url_exist),
+                    "image_url_rel": rel_url_exist,
+                }
+        try:
+            tmp_path.replace(out_path)
+        except Exception:
+            shutil.move(str(tmp_path), str(out_path))
+
         rel_url = f"/static/global_gallery/{cat_safe}/{out_name}"
+        rel_path = f"{cat_safe}/{out_name}"
+        _gallery_media_upsert(rel_path, cat_safe, file_hash)
         abs_url = _coerce_image_url(request, rel_url)
         return {
             "ok": True,
@@ -3150,6 +3320,11 @@ def create_app(
         start = (page_num - 1) * ps
         end = start + ps
         page_items = files[start:end]
+        stats_map = _gallery_stats_get_map([str(x.get("rel_path") or "") for x in page_items])
+        for it in page_items:
+            st = stats_map.get(str(it.get("rel_path") or ""), {})
+            it["selected_count"] = int(st.get("selected_count") or 0)
+            it["downloaded_count"] = int(st.get("downloaded_count") or 0)
         total_pages = max(1, (total + ps - 1) // ps)
         return {
             "ok": True,
@@ -3295,6 +3470,7 @@ def create_app(
             dst = (dst_dir / f"{stem}_{uuid.uuid4().hex[:8]}{ext}").resolve()
         shutil.move(str(src), str(dst))
         new_rel = dst.relative_to(root).as_posix()
+        _gallery_stats_move_rel(safe_rel, new_rel)
         _gallery_category_touch(cat)
         return {"ok": True, "rel_path": new_rel}
 
@@ -3327,6 +3503,7 @@ def create_app(
             dst = (src.parent / f"{base}_{uuid.uuid4().hex[:8]}{ext}").resolve()
         src.rename(dst)
         rel = dst.relative_to(root).as_posix()
+        _gallery_stats_move_rel(safe_rel, rel)
         return {"ok": True, "rel_path": rel, "name": dst.name}
 
     @api.post("/gallery/replace")
@@ -3368,6 +3545,19 @@ def create_app(
             except Exception:
                 pass
         rel = target.relative_to(root).as_posix()
+        try:
+            h = hashlib.sha1()
+            with open(target, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            cat = str(Path(rel).parent.as_posix() or "all")
+            _gallery_media_upsert(rel, cat, h.hexdigest().lower())
+        except Exception:
+            pass
+        if rel != safe_rel:
+            _gallery_stats_move_rel(safe_rel, rel)
         return {"ok": True, "rel_path": rel}
 
     @api.delete("/gallery/item")
@@ -3387,6 +3577,13 @@ def create_app(
         if not p.exists() or not p.is_file():
             raise HTTPException(status_code=404, detail="file not found")
         p.unlink(missing_ok=False)
+        con = _connect(db_path)
+        try:
+            con.execute("DELETE FROM gallery_image_stats WHERE rel_path=?", (safe_rel,))
+            con.execute("DELETE FROM gallery_media_index WHERE rel_path=?", (safe_rel,))
+            con.commit()
+        finally:
+            con.close()
         return {"ok": True}
 
     @api.post("/gallery/delete_many")
@@ -3413,6 +3610,13 @@ def create_app(
                     fail += 1
                     continue
                 p.unlink(missing_ok=False)
+                con = _connect(db_path)
+                try:
+                    con.execute("DELETE FROM gallery_image_stats WHERE rel_path=?", (safe_rel,))
+                    con.execute("DELETE FROM gallery_media_index WHERE rel_path=?", (safe_rel,))
+                    con.commit()
+                finally:
+                    con.close()
                 ok += 1
             except Exception:
                 fail += 1
@@ -3449,11 +3653,68 @@ def create_app(
                 if dst.exists():
                     dst = (dst_dir / f"{src.stem}_{uuid.uuid4().hex[:8]}{src.suffix}").resolve()
                 shutil.move(str(src), str(dst))
+                _gallery_stats_move_rel(safe_rel, dst.relative_to(root).as_posix())
                 moved += 1
             except Exception:
                 failed += 1
         _gallery_category_touch(cat)
         return {"ok": True, "moved": moved, "failed": failed, "category": cat}
+
+    @api.post("/gallery/track_select")
+    async def api_gallery_track_select(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth_gallery_admin(request, x_api_key)
+        payload = await _read_payload_any(request)
+        rp = ""
+        if isinstance(payload, dict):
+            rp = str(payload.get("rel_path") or "").strip()
+        rp = rp.replace("\\", "/").lstrip("/")
+        if not rp:
+            raise HTTPException(status_code=400, detail="rel_path required")
+        _gallery_stats_touch(rp, "selected")
+        return {"ok": True}
+
+    @api.get("/gallery/stats/top")
+    def api_gallery_stats_top(
+        request: Request,
+        metric: str = "selected",
+        limit: int = 10,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _auth_gallery_admin(request, x_api_key)
+        m = str(metric or "selected").strip().lower()
+        col = "selected_count" if m == "selected" else "downloaded_count"
+        lim = min(100, max(1, int(limit or 10)))
+        con = _connect(db_path)
+        try:
+            rows = con.execute(
+                f"""
+                SELECT rel_path, selected_count, downloaded_count, last_selected_at, last_downloaded_at
+                FROM gallery_image_stats
+                ORDER BY {col} DESC, rel_path ASC
+                LIMIT ?
+                """,
+                (lim,),
+            ).fetchall()
+            out = []
+            for r in rows:
+                rel = str(r["rel_path"] or "").replace("\\", "/").lstrip("/")
+                url = _coerce_image_url(request, f"/static/global_gallery/{rel}") if rel else ""
+                out.append(
+                    {
+                        "rel_path": rel,
+                        "url": url,
+                        "selected_count": int(r["selected_count"] or 0),
+                        "downloaded_count": int(r["downloaded_count"] or 0),
+                        "last_selected_at": str(r["last_selected_at"] or ""),
+                        "last_downloaded_at": str(r["last_downloaded_at"] or ""),
+                    }
+                )
+            return {"ok": True, "metric": m, "limit": lim, "items": out}
+        finally:
+            con.close()
 
     @api.get("/gallery/brand")
     def api_gallery_brand_get(
@@ -5378,44 +5639,287 @@ button{cursor:pointer;border:0;background:var(--dark);color:#fff}button.ok{backg
 <body><div class="wrap"><div class="hero"><img id="brandLogo" class="logo" src="" alt="logo"><div><h1 id="brandName">Company Media Center</h1><p id="brandTag">Global gallery for all branches and customers</p></div></div>
 <div id="loginCard" class="card" style="margin-top:12px;max-width:520px;"><div class="title">Sign In</div><div class="row"><input id="loginUser" placeholder="Username" style="flex:1" /></div><div class="row" style="margin-top:8px"><input id="loginPass" type="password" placeholder="Password" style="flex:1" /></div><div class="row" style="margin-top:8px"><button class="ok" onclick="loginUserPass()">Login</button></div><div class="muted" style="margin-top:8px">Admin recovery: use API Key login</div><div class="row" style="margin-top:6px"><input id="loginApiKey" type="password" placeholder="API Key (recovery)" style="flex:1" /><button onclick="loginApiKey()">Login with API Key</button></div><div id="loginMsg" class="msg"></div></div>
 <div id="appArea" class="hidden"><div class="toolbar card" style="margin-top:12px;"><span id="who" class="muted"></span><button class="alt" onclick="bootstrap()">Reload</button><button class="danger" onclick="logout()">Logout</button><span id="statsTop" class="muted"></span></div>
-<div class="grid"><div><div class="card"><div class="title">Categories</div><div class="row"><input id="newCat" placeholder="new category" style="flex:1" /><button class="ok" onclick="createCategory()">Create</button></div><div class="row" style="margin-top:8px"><select id="moveToCat" style="flex:1"></select><button class="danger" onclick="deleteCategory()">Delete</button></div><div class="row" style="margin-top:6px"><button class="alt" onclick="moveCategory(-1)">Move Up</button><button class="alt" onclick="moveCategory(1)">Move Down</button></div><div class="cats" id="catList" style="margin-top:8px"></div></div><div class="card" style="margin-top:10px;"><div class="title">Upload</div><input id="filesInput" type="file" accept=".png,.jpg,.jpeg,.webp" multiple /><div style="margin-top:6px"><input id="folderInput" type="file" webkitdirectory directory multiple /></div><div class="drop" id="dropZone" style="margin-top:8px">Drop image files/folders here</div><div class="row" style="margin-top:8px"><button class="ok" onclick="uploadSelected()">Upload Selected</button><span id="uploadInfo" class="muted">0 files selected</span></div></div></div>
+<div class="grid"><div><div class="card"><div class="title">Categories</div><div class="row"><input id="newCat" placeholder="new category" style="flex:1" /><button class="ok" onclick="createCategory()">Create</button></div><div class="row" style="margin-top:8px"><select id="moveToCat" style="flex:1"></select><button class="danger" onclick="deleteCategory()">Delete</button></div><div class="row" style="margin-top:6px"><button class="alt" onclick="moveCategory(-1)">Move Up</button><button class="alt" onclick="moveCategory(1)">Move Down</button></div><div class="cats" id="catList" style="margin-top:8px"></div></div><div class="card" style="margin-top:10px;"><div class="title">Upload</div><input id="filesInput" type="file" accept=".png,.jpg,.jpeg,.webp" multiple /><div style="margin-top:6px"><input id="folderInput" type="file" webkitdirectory directory multiple /></div><div class="drop" id="dropZone" style="margin-top:8px">Drop image files/folders here</div><div class="row" style="margin-top:8px"><button class="ok" id="uploadBtn" onclick="uploadSelected()">Upload Selected</button><span id="uploadInfo" class="muted">0 files selected</span></div></div></div>
 <div class="card"><div class="toolbar"><div class="title" style="margin:0">Images</div><input id="search" placeholder="search..." oninput="loadItems(1)" /><button onclick="loadItems(pageState.page)">Refresh</button><select id="bulkMoveTo"></select><button class="alt" onclick="moveSelected()">Move Selected</button><button class="danger" onclick="deleteSelected()">Delete Selected</button><button class="alt" onclick="selectAllVisible()">Select Page</button><button class="alt" onclick="clearSelection()">Clear</button></div><div id="msg" class="msg"></div><div id="gallery" class="gallery"></div><div class="toolbar" style="margin-top:8px;"><button class="alt" onclick="prevPage()">Prev</button><span id="pager" class="muted"></span><button class="alt" onclick="nextPage()">Next</button><select id="pageSize" onchange="loadItems(1)"><option>60</option><option selected>120</option><option>240</option></select></div></div>
-<div><div class="card"><div class="title">Branding</div><input id="bName" placeholder="Company name" /><div style="margin-top:6px"><input id="bTag" placeholder="Tagline" /></div><div style="margin-top:6px"><input id="bLogo" placeholder="Logo URL (https://...)" /></div><div style="margin-top:6px"><textarea id="bAbout" placeholder="About text"></textarea></div><div class="row"><button class="ok" id="saveBrandBtn" onclick="saveBrand()">Save Branding</button></div></div><div id="usersCard" class="card" style="margin-top:10px;"><div class="title">Team Access</div><div class="row"><input id="uUser" placeholder="username" style="flex:1" /><select id="uRole"><option value="editor">editor</option><option value="admin">admin</option></select></div><div style="margin-top:6px"><input id="uName" placeholder="display name" /></div><div style="margin-top:6px"><input id="uPass" type="password" placeholder="password (new or change)" /></div><div class="row" style="margin-top:6px"><label><input id="uActive" type="checkbox" checked /> active</label><button class="ok" onclick="saveUser()">Save User</button></div><div class="sep"></div><div id="usersList" class="muted"></div></div></div></div></div></div>
+<div><div class="card"><div class="title">Branding</div><input id="bName" placeholder="Company name" /><div style="margin-top:6px"><input id="bTag" placeholder="Tagline" /></div><div style="margin-top:6px"><input id="bLogo" placeholder="Logo URL (https://...)" /></div><div style="margin-top:6px"><textarea id="bAbout" placeholder="About text"></textarea></div><div class="row"><button class="ok" id="saveBrandBtn" onclick="saveBrand()">Save Branding</button></div></div><div id="usersCard" class="card" style="margin-top:10px;"><div class="title">Team Access</div><div class="row"><input id="uUser" placeholder="username" style="flex:1" /><select id="uRole"><option value="editor">editor</option><option value="admin">admin</option></select></div><div style="margin-top:6px"><input id="uName" placeholder="display name" /></div><div style="margin-top:6px"><input id="uPass" type="password" placeholder="password (new or change)" /></div><div class="row" style="margin-top:6px"><label><input id="uActive" type="checkbox" checked /> active</label><button class="ok" onclick="saveUser()">Save User</button></div><div class="sep"></div><div id="usersList" class="muted"></div></div><div class="card" style="margin-top:10px;"><div class="title">Top 10 Stats</div><div class="row"><button class="alt" onclick="loadTop('selected')">Top Selected</button><button class="alt" onclick="loadTop('downloaded')">Top Downloaded</button></div><div id="topList" class="muted" style="margin-top:8px"></div></div></div></div></div></div>
 <script>
-let categories=[],items=[],currentCategory="all",selectedFiles=[],checked=new Set(),authUser=null;const pageState={page:1,totalPages:1,total:0};
-const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const msg=(t,ok=false)=>{const m=document.getElementById("msg");m.textContent=t||"";m.style.color=ok?"#065f46":"#b91c1c";};
-const loginMsg=(t,ok=false)=>{const m=document.getElementById("loginMsg");m.textContent=t||"";m.style.color=ok?"#065f46":"#b91c1c";};
-const hsize=n=>{n=Number(n||0);if(n<1024)return n+" B";if(n<1048576)return (n/1024).toFixed(1)+" KB";return (n/1048576).toFixed(1)+" MB";};
-async function api(url,opt={}){const o=Object.assign({},opt||{});o.credentials="include";if(o.body&&!(o.body instanceof FormData))o.headers=Object.assign({"Content-Type":"application/json"},o.headers||{});return fetch(url,o);}async function authCheck(){const r=await api("/gallery-admin/me");if(!r.ok)return null;const j=await r.json();return j&&j.ok?j.user:null;}
-async function loginUserPass(){const u=(document.getElementById("loginUser").value||"").trim();const p=(document.getElementById("loginPass").value||"").trim();if(!u||!p){loginMsg("Enter username and password.");return;}const r=await api("/gallery-admin/login",{method:"POST",body:JSON.stringify({username:u,password:p})});if(!r.ok){loginMsg("Login failed: "+r.status);return;}await bootstrap();}
-async function loginApiKey(){const k=(document.getElementById("loginApiKey").value||"").trim();if(!k){loginMsg("Enter api key");return;}const r=await api("/gallery-admin/login",{method:"POST",body:JSON.stringify({api_key:k})});if(!r.ok){loginMsg("API key login failed: "+r.status);return;}await bootstrap();}
-async function logout(){await api("/gallery-admin/logout",{method:"POST"});authUser=null;renderAuth();}
-function renderAuth(){const ok=!!authUser;document.getElementById("loginCard").classList.toggle("hidden",ok);document.getElementById("appArea").classList.toggle("hidden",!ok);if(ok){document.getElementById("who").textContent=`User: ${authUser.username} (${authUser.role})`;document.getElementById("usersCard").classList.toggle("hidden",authUser.role!=="admin");document.getElementById("saveBrandBtn").disabled=(authUser.role!=="admin");}}
-async function loadBrand(){const r=await api("/api/gallery/brand");if(!r.ok)return;const j=await r.json();const b=(j||{}).brand||{};document.getElementById("brandName").textContent=b.company_name||"Company Media Center";document.getElementById("brandTag").textContent=b.tagline||"Global gallery";document.getElementById("brandLogo").src=b.logo_url||"";document.getElementById("bName").value=b.company_name||"";document.getElementById("bTag").value=b.tagline||"";document.getElementById("bLogo").value=b.logo_url||"";document.getElementById("bAbout").value=b.about_text||"";}
-async function saveBrand(){if(!authUser||authUser.role!=="admin")return;const payload={company_name:document.getElementById("bName").value,tagline:document.getElementById("bTag").value,logo_url:document.getElementById("bLogo").value,about_text:document.getElementById("bAbout").value};const r=await api("/api/gallery/brand",{method:"PUT",body:JSON.stringify(payload)});if(!r.ok){msg("Save branding failed: "+r.status);return;}await loadBrand();msg("Branding saved.",true);}
-async function loadUsers(){if(!authUser||authUser.role!=="admin")return;const r=await api("/api/gallery/users");if(!r.ok)return;const j=await r.json();const list=Array.isArray(j.items)?j.items:[];const root=document.getElementById("usersList");root.innerHTML="";list.forEach(u=>{const div=document.createElement("div");div.style.padding="6px 0";div.innerHTML=`<b>${esc(u.username)}</b> (${esc(u.role)}) ${u.active?'<span style="color:#065f46">active</span>':'<span style="color:#b91c1c">inactive</span>'} <button class="alt" onclick="fillUser('${esc(u.username)}','${esc(u.display_name||"")}','${esc(u.role)}',${u.active?1:0})">Edit</button> <button class="danger" onclick="delUser('${esc(u.username)}')">Delete</button>`;root.appendChild(div);});}
-function fillUser(u,n,r,a){document.getElementById("uUser").value=u;document.getElementById("uName").value=n;document.getElementById("uRole").value=r;document.getElementById("uActive").checked=!!a;document.getElementById("uPass").value="";}
-async function saveUser(){if(!authUser||authUser.role!=="admin")return;const p={username:document.getElementById("uUser").value.trim(),display_name:document.getElementById("uName").value.trim(),role:document.getElementById("uRole").value,password:document.getElementById("uPass").value,active:document.getElementById("uActive").checked};if(!p.username){msg("Username required.");return;}const r=await api("/api/gallery/users",{method:"POST",body:JSON.stringify(p)});if(!r.ok){msg("Save user failed: "+r.status);return;}document.getElementById("uPass").value="";await loadUsers();msg("User saved.",true);}async function delUser(u){if(!confirm(`Delete user ${u}?`))return;const r=await api(`/api/gallery/users/${encodeURIComponent(u)}`,{method:"DELETE"});if(!r.ok){msg("Delete user failed: "+r.status);return;}await loadUsers();msg("User deleted.",true);}
-async function loadCategories(){const r=await api("/api/gallery/categories");if(!r.ok){msg("Category load failed: "+r.status);return;}const j=await r.json();categories=Array.isArray(j.items)?j.items:[];if(!categories.find(x=>x.name===currentCategory))currentCategory="all";renderCategories();}
-function renderCategories(){const catList=document.getElementById("catList");catList.innerHTML="";categories.forEach(c=>{const row=document.createElement("div");row.className="cat"+(c.name===currentCategory?" active":"");row.innerHTML=`<img class="thumb" src="${esc(c.thumbnail_url||"")}" /><div style="flex:1"><div>${esc(c.name)}</div><div class="muted">${Number(c.count||0)} images</div></div>`;row.onclick=()=>{currentCategory=c.name;renderCategories();loadItems(1);};catList.appendChild(row);});const opts=categories.map(c=>`<option value="${esc(c.name)}">${esc(c.name)}</option>`).join("");["moveToCat","bulkMoveTo"].forEach(id=>{const el=document.getElementById(id);if(el){el.innerHTML=opts;el.value=currentCategory||"all";}});}async function moveCategory(dir){if(!authUser||authUser.role!=="admin")return;const idx=categories.findIndex(c=>c.name===currentCategory);if(idx<0)return;const ni=idx+dir;if(ni<0||ni>=categories.length)return;const arr=categories.map(c=>c.name);[arr[idx],arr[ni]]=[arr[ni],arr[idx]];const r=await api("/api/gallery/categories/order",{method:"POST",body:JSON.stringify({names:arr})});if(!r.ok){msg("Reorder failed: "+r.status);return;}await loadCategories();msg("Category order updated.",true);} 
-async function createCategory(){const raw=document.getElementById("newCat").value||"";if(!raw.trim()){msg("Enter category name.");return;}const fd=new FormData();fd.append("name",raw);const r=await api("/api/gallery/categories",{method:"POST",body:fd});if(!r.ok){msg("Create category failed: "+r.status);return;}document.getElementById("newCat").value="";await loadCategories();msg("Category created.",true);} 
-async function deleteCategory(){if(currentCategory==="all"){msg("Cannot delete 'all'.");return;}const moveTo=document.getElementById("moveToCat").value||"all";if(moveTo===currentCategory){msg("Select another target.");return;}if(!confirm(`Delete '${currentCategory}' and move files to '${moveTo}'?`))return;const r=await api(`/api/gallery/categories?name=${encodeURIComponent(currentCategory)}&move_to=${encodeURIComponent(moveTo)}`,{method:"DELETE"});if(!r.ok){msg("Delete category failed: "+r.status);return;}currentCategory="all";await loadCategories();await loadItems(1);msg("Category deleted.",true);} 
-async function loadItems(page=1){const q=(document.getElementById("search").value||"").trim();const ps=Number(document.getElementById("pageSize").value||120);const u=`/api/gallery/list?category=${encodeURIComponent(currentCategory)}&q=${encodeURIComponent(q)}&page=${page}&page_size=${ps}`;const r=await api(u);if(!r.ok){msg("Load images failed: "+r.status);return;}const j=await r.json();items=Array.isArray(j.items)?j.items:[];pageState.page=Number(j.page||1);pageState.totalPages=Number(j.total_pages||1);pageState.total=Number(j.total||0);checked=new Set();renderGrid();document.getElementById("pager").textContent=`Page ${pageState.page}/${pageState.totalPages} (${pageState.total} total)`;document.getElementById("statsTop").textContent=`${pageState.total} images in '${currentCategory}'`;}
-function prevPage(){if(pageState.page>1)loadItems(pageState.page-1);} function nextPage(){if(pageState.page<pageState.totalPages)loadItems(pageState.page+1);} function categoryOptionsHtml(sel){return categories.map(c=>`<option value="${esc(c.name)}"${c.name===sel?" selected":""}>${esc(c.name)}</option>`).join("");}
-function toggleCheck(rel,on){if(on)checked.add(rel);else checked.delete(rel);} function selectAllVisible(){items.forEach(it=>checked.add(it.rel_path));renderGrid();msg(`${items.length} selected`,true);} function clearSelection(){checked=new Set();renderGrid();msg("Selection cleared.",true);} 
-function renderGrid(){const root=document.getElementById("gallery");root.innerHTML="";items.forEach(it=>{const id=btoa(it.rel_path).replace(/=/g,"_");const tile=document.createElement("div");tile.className="tile";tile.innerHTML=`<img class="img" src="${it.url}" loading="lazy" /><div class="meta"><div class="row"><input type="checkbox" ${checked.has(it.rel_path)?"checked":""} onchange="toggleCheck('${esc(it.rel_path)}',this.checked)" /></div><div class="name">${esc(it.name)}</div><div class="small">${esc(it.category)} | ${hsize(it.size)}</div><div class="row"><select id="mv_${id}" style="flex:1">${categoryOptionsHtml(it.category)}</select><button class="alt" onclick="moveItem('${encodeURIComponent(it.rel_path)}','mv_${id}')">Move</button></div><div class="row" style="margin-top:6px"><input id="rn_${id}" placeholder="new name" style="flex:1" /><button class="alt" onclick="renameItem('${encodeURIComponent(it.rel_path)}','rn_${id}')">Rename</button></div><div class="row" style="margin-top:6px"><input id="rp_${id}" type="file" accept=".png,.jpg,.jpeg,.webp" style="flex:1" /><button class="alt" onclick="replaceItem('${encodeURIComponent(it.rel_path)}','rp_${id}')">Replace</button><button class="danger" onclick="deleteItem('${encodeURIComponent(it.rel_path)}')">Delete</button></div></div>`;root.appendChild(tile);});}
-async function moveItem(rel,inputId){const nc=document.getElementById(inputId).value||"all";const fd=new FormData();fd.append("rel_path",decodeURIComponent(rel));fd.append("new_category",nc);const r=await api("/api/gallery/move",{method:"POST",body:fd});if(!r.ok){msg("Move failed: "+r.status);return;}await loadCategories();await loadItems(pageState.page);msg("Moved.",true);} 
-async function moveSelected(){const arr=Array.from(checked.values());if(!arr.length){msg("No selection.");return;}const nc=document.getElementById("bulkMoveTo").value||"all";const r=await api("/api/gallery/move_many",{method:"POST",body:JSON.stringify({rel_paths:arr,new_category:nc})});if(!r.ok){msg("Batch move failed: "+r.status);return;}await loadCategories();await loadItems(pageState.page);msg("Batch move done.",true);} 
-async function deleteItem(rel){if(!confirm("Delete image?"))return;const r=await api(`/api/gallery/item?rel_path=${rel}`,{method:"DELETE"});if(!r.ok){msg("Delete failed: "+r.status);return;}await loadCategories();await loadItems(pageState.page);msg("Deleted.",true);} 
-async function deleteSelected(){const arr=Array.from(checked.values());if(!arr.length){msg("No selection.");return;}if(!confirm(`Delete ${arr.length} images?`))return;const r=await api("/api/gallery/delete_many",{method:"POST",body:JSON.stringify({rel_paths:arr})});if(!r.ok){msg("Batch delete failed: "+r.status);return;}await loadCategories();await loadItems(pageState.page);msg("Batch delete done.",true);} 
-async function renameItem(rel,id){const nv=(document.getElementById(id).value||"").trim();if(!nv){msg("Enter new name.");return;}const fd=new FormData();fd.append("rel_path",decodeURIComponent(rel));fd.append("new_name",nv);const r=await api("/api/gallery/rename",{method:"POST",body:fd});if(!r.ok){msg("Rename failed: "+r.status);return;}await loadItems(pageState.page);msg("Renamed.",true);} 
-async function replaceItem(rel,id){const el=document.getElementById(id);if(!el||!el.files||!el.files[0]){msg("Choose replacement file.");return;}const fd=new FormData();fd.append("rel_path",decodeURIComponent(rel));fd.append("file",el.files[0]);const r=await api("/api/gallery/replace",{method:"POST",body:fd});if(!r.ok){msg("Replace failed: "+r.status);return;}await loadItems(pageState.page);msg("Replaced.",true);} 
-function pickFilesFromInput(input){selectedFiles=Array.from((input.files||[])).filter(f=>/\.(png|jpg|jpeg|webp)$/i.test(f.name));document.getElementById("uploadInfo").textContent=`${selectedFiles.length} files selected`;}
-async function uploadSelected(){if(!selectedFiles.length){msg("No files selected.");return;}let ok=0,fail=0;for(const f of selectedFiles){const fd=new FormData();fd.append("file",f);fd.append("category",currentCategory||"all");try{const r=await api("/api/menu/upload_image",{method:"POST",body:fd});if(r.ok)ok++;else fail++;}catch(_){fail++;}}await loadCategories();await loadItems(pageState.page);msg(`Upload complete OK=${ok}, Fail=${fail}`,fail===0);} 
-function setupDrop(){const dz=document.getElementById("dropZone");dz.addEventListener("dragover",e=>{e.preventDefault();dz.style.background="#ecfeff";});dz.addEventListener("dragleave",()=>{dz.style.background="#f8fbff";});dz.addEventListener("drop",e=>{e.preventDefault();dz.style.background="#f8fbff";selectedFiles=Array.from(e.dataTransfer.files||[]).filter(f=>/\.(png|jpg|jpeg|webp)$/i.test(f.name));document.getElementById("uploadInfo").textContent=`${selectedFiles.length} files selected`;});}
-async function bootstrap(){authUser=await authCheck();renderAuth();if(!authUser)return;await loadBrand();await loadCategories();await loadItems(1);if(authUser.role==="admin")await loadUsers();msg("Ready.",true);} 
-document.getElementById("filesInput").addEventListener("change",e=>pickFilesFromInput(e.target));document.getElementById("folderInput").addEventListener("change",e=>pickFilesFromInput(e.target));setupDrop();bootstrap();
+let categories = [], items = [], currentCategory = "all", selectedFiles = [], checked = new Set(), authUser = null, uploadInProgress = false;
+const pageState = { page: 1, totalPages: 1, total: 0 };
+const esc = (s) => String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
+const msg = (t, ok = false) => { const m = document.getElementById("msg"); m.textContent = t || ""; m.style.color = ok ? "#065f46" : "#b91c1c"; };
+const loginMsg = (t, ok = false) => { const m = document.getElementById("loginMsg"); m.textContent = t || ""; m.style.color = ok ? "#065f46" : "#b91c1c"; };
+const hsize = (n) => { n = Number(n || 0); if (n < 1024) return n + " B"; if (n < 1048576) return (n / 1024).toFixed(1) + " KB"; return (n / 1048576).toFixed(1) + " MB"; };
+
+async function api(url, opt = {}) {
+  const o = Object.assign({}, opt || {});
+  o.credentials = "include";
+  if (o.body && !(o.body instanceof FormData)) o.headers = Object.assign({ "Content-Type": "application/json" }, o.headers || {});
+  const res = await fetch(url, o);
+  if (res.status === 401) {
+    authUser = null;
+    renderAuth();
+    loginMsg("Session expired. Please login again.");
+  }
+  return res;
+}
+
+async function authCheck() { const r = await api("/gallery-admin/me"); if (!r.ok) return null; const j = await r.json(); return j && j.ok ? j.user : null; }
+async function loginUserPass() { const u = (document.getElementById("loginUser").value || "").trim(); const p = (document.getElementById("loginPass").value || "").trim(); if (!u || !p) { loginMsg("Enter username and password."); return; } const r = await api("/gallery-admin/login", { method: "POST", body: JSON.stringify({ username: u, password: p }) }); if (!r.ok) { loginMsg("Login failed: " + r.status); return; } await bootstrap(); }
+async function loginApiKey() { const k = (document.getElementById("loginApiKey").value || "").trim(); if (!k) { loginMsg("Enter api key"); return; } const r = await api("/gallery-admin/login", { method: "POST", body: JSON.stringify({ api_key: k }) }); if (!r.ok) { loginMsg("API key login failed: " + r.status); return; } await bootstrap(); }
+async function logout() { await api("/gallery-admin/logout", { method: "POST" }); authUser = null; renderAuth(); }
+
+function renderAuth() {
+  const ok = !!authUser;
+  document.getElementById("loginCard").classList.toggle("hidden", ok);
+  document.getElementById("appArea").classList.toggle("hidden", !ok);
+  if (ok) {
+    document.getElementById("who").textContent = `User: ${authUser.username} (${authUser.role})`;
+    document.getElementById("usersCard").classList.toggle("hidden", authUser.role !== "admin");
+    document.getElementById("saveBrandBtn").disabled = (authUser.role !== "admin");
+  }
+}
+
+async function loadBrand() {
+  const r = await api("/api/gallery/brand");
+  if (!r.ok) return;
+  const j = await r.json();
+  const b = (j || {}).brand || {};
+  document.getElementById("brandName").textContent = b.company_name || "Company Media Center";
+  document.getElementById("brandTag").textContent = b.tagline || "Global gallery";
+  document.getElementById("brandLogo").src = b.logo_url || "";
+  document.getElementById("bName").value = b.company_name || "";
+  document.getElementById("bTag").value = b.tagline || "";
+  document.getElementById("bLogo").value = b.logo_url || "";
+  document.getElementById("bAbout").value = b.about_text || "";
+}
+
+async function saveBrand() {
+  if (!authUser || authUser.role !== "admin") return;
+  const payload = {
+    company_name: document.getElementById("bName").value,
+    tagline: document.getElementById("bTag").value,
+    logo_url: document.getElementById("bLogo").value,
+    about_text: document.getElementById("bAbout").value
+  };
+  const r = await api("/api/gallery/brand", { method: "PUT", body: JSON.stringify(payload) });
+  if (!r.ok) { msg("Save branding failed: " + r.status); return; }
+  await loadBrand();
+  msg("Branding saved.", true);
+}
+
+async function loadUsers() {
+  if (!authUser || authUser.role !== "admin") return;
+  const r = await api("/api/gallery/users");
+  if (!r.ok) return;
+  const j = await r.json();
+  const list = Array.isArray(j.items) ? j.items : [];
+  const root = document.getElementById("usersList");
+  root.innerHTML = "";
+  list.forEach((u) => {
+    const div = document.createElement("div");
+    div.style.padding = "6px 0";
+    div.innerHTML = `<b>${esc(u.username)}</b> (${esc(u.role)}) ${u.active ? '<span style="color:#065f46">active</span>' : '<span style="color:#b91c1c">inactive</span>'} <button class="alt" onclick="fillUser('${esc(u.username)}','${esc(u.display_name || "")}','${esc(u.role)}',${u.active ? 1 : 0})">Edit</button> <button class="danger" onclick="delUser('${esc(u.username)}')">Delete</button>`;
+    root.appendChild(div);
+  });
+}
+
+function fillUser(u, n, r, a) { document.getElementById("uUser").value = u; document.getElementById("uName").value = n; document.getElementById("uRole").value = r; document.getElementById("uActive").checked = !!a; document.getElementById("uPass").value = ""; }
+async function saveUser() { if (!authUser || authUser.role !== "admin") return; const p = { username: document.getElementById("uUser").value.trim(), display_name: document.getElementById("uName").value.trim(), role: document.getElementById("uRole").value, password: document.getElementById("uPass").value, active: document.getElementById("uActive").checked }; if (!p.username) { msg("Username required."); return; } const r = await api("/api/gallery/users", { method: "POST", body: JSON.stringify(p) }); if (!r.ok) { msg("Save user failed: " + r.status); return; } document.getElementById("uPass").value = ""; await loadUsers(); msg("User saved.", true); }
+async function delUser(u) { if (!confirm(`Delete user ${u}?`)) return; const r = await api(`/api/gallery/users/${encodeURIComponent(u)}`, { method: "DELETE" }); if (!r.ok) { msg("Delete user failed: " + r.status); return; } await loadUsers(); msg("User deleted.", true); }
+
+async function loadCategories() {
+  const r = await api("/api/gallery/categories");
+  if (!r.ok) { msg("Category load failed: " + r.status); return; }
+  const j = await r.json();
+  categories = Array.isArray(j.items) ? j.items : [];
+  if (!categories.find((x) => x.name === currentCategory)) currentCategory = "all";
+  renderCategories();
+}
+
+function renderCategories() {
+  const catList = document.getElementById("catList");
+  catList.innerHTML = "";
+  categories.forEach((c) => {
+    const row = document.createElement("div");
+    row.className = "cat" + (c.name === currentCategory ? " active" : "");
+    row.innerHTML = `<img class="thumb" src="${esc(c.thumbnail_url || "")}" /><div style="flex:1"><div>${esc(c.name)}</div><div class="muted">${Number(c.count || 0)} images</div></div>`;
+    row.onclick = () => { currentCategory = c.name; renderCategories(); loadItems(1); };
+    catList.appendChild(row);
+  });
+  const opts = categories.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join("");
+  ["moveToCat", "bulkMoveTo"].forEach((id) => { const el = document.getElementById(id); if (el) { el.innerHTML = opts; el.value = currentCategory || "all"; } });
+}
+
+async function moveCategory(dir) {
+  if (!authUser || authUser.role !== "admin") return;
+  const idx = categories.findIndex((c) => c.name === currentCategory);
+  if (idx < 0) return;
+  const ni = idx + dir;
+  if (ni < 0 || ni >= categories.length) return;
+  const arr = categories.map((c) => c.name);
+  [arr[idx], arr[ni]] = [arr[ni], arr[idx]];
+  const r = await api("/api/gallery/categories/order", { method: "POST", body: JSON.stringify({ names: arr }) });
+  if (!r.ok) { msg("Reorder failed: " + r.status); return; }
+  await loadCategories();
+  msg("Category order updated.", true);
+}
+
+async function createCategory() {
+  const raw = document.getElementById("newCat").value || "";
+  if (!raw.trim()) { msg("Enter category name."); return; }
+  const fd = new FormData();
+  fd.append("name", raw);
+  const r = await api("/api/gallery/categories", { method: "POST", body: fd });
+  if (!r.ok) { msg("Create category failed: " + r.status); return; }
+  document.getElementById("newCat").value = "";
+  await loadCategories();
+  msg("Category created.", true);
+}
+
+async function deleteCategory() {
+  if (currentCategory === "all") { msg("Cannot delete 'all'."); return; }
+  const moveTo = document.getElementById("moveToCat").value || "all";
+  if (moveTo === currentCategory) { msg("Select another target."); return; }
+  if (!confirm(`Delete '${currentCategory}' and move files to '${moveTo}'?`)) return;
+  const r = await api(`/api/gallery/categories?name=${encodeURIComponent(currentCategory)}&move_to=${encodeURIComponent(moveTo)}`, { method: "DELETE" });
+  if (!r.ok) { msg("Delete category failed: " + r.status); return; }
+  currentCategory = "all";
+  await loadCategories();
+  await loadItems(1);
+  msg("Category deleted.", true);
+}
+
+async function loadItems(page = 1) {
+  const q = (document.getElementById("search").value || "").trim();
+  const ps = Number(document.getElementById("pageSize").value || 120);
+  const u = `/api/gallery/list?category=${encodeURIComponent(currentCategory)}&q=${encodeURIComponent(q)}&page=${page}&page_size=${ps}`;
+  const r = await api(u);
+  if (!r.ok) { msg("Load images failed: " + r.status); return; }
+  const j = await r.json();
+  items = Array.isArray(j.items) ? j.items : [];
+  pageState.page = Number(j.page || 1);
+  pageState.totalPages = Number(j.total_pages || 1);
+  pageState.total = Number(j.total || 0);
+  checked = new Set();
+  renderGrid();
+  document.getElementById("pager").textContent = `Page ${pageState.page}/${pageState.totalPages} (${pageState.total} total)`;
+  document.getElementById("statsTop").textContent = `${pageState.total} images in '${currentCategory}'`;
+}
+
+function prevPage() { if (pageState.page > 1) loadItems(pageState.page - 1); }
+function nextPage() { if (pageState.page < pageState.totalPages) loadItems(pageState.page + 1); }
+function categoryOptionsHtml(sel) { return categories.map((c) => `<option value="${esc(c.name)}"${c.name === sel ? " selected" : ""}>${esc(c.name)}</option>`).join(""); }
+async function trackSelect(relPath) { try { await api("/api/gallery/track_select", { method: "POST", body: JSON.stringify({ rel_path: relPath }) }); } catch (_) {} }
+function toggleCheck(rel, on) { if (on) { checked.add(rel); trackSelect(rel); } else checked.delete(rel); }
+function selectAllVisible() { items.forEach((it) => checked.add(it.rel_path)); renderGrid(); msg(`${items.length} selected`, true); }
+function clearSelection() { checked = new Set(); renderGrid(); msg("Selection cleared.", true); }
+
+function renderGrid() {
+  const root = document.getElementById("gallery");
+  root.innerHTML = "";
+  items.forEach((it) => {
+    const id = btoa(it.rel_path).replace(/=/g, "_");
+    const tile = document.createElement("div");
+    tile.className = "tile";
+    tile.innerHTML = `<img class="img" src="${it.url}" loading="lazy" /><div class="meta"><div class="row"><input type="checkbox" ${checked.has(it.rel_path) ? "checked" : ""} onchange="toggleCheck('${esc(it.rel_path)}',this.checked)" /></div><div class="name">${esc(it.name)}</div><div class="small">${esc(it.category)} | ${hsize(it.size)}</div><div class="small">Selected: ${Number(it.selected_count || 0)} | Downloaded: ${Number(it.downloaded_count || 0)}</div><div class="row"><select id="mv_${id}" style="flex:1">${categoryOptionsHtml(it.category)}</select><button class="alt" onclick="moveItem('${encodeURIComponent(it.rel_path)}','mv_${id}')">Move</button></div><div class="row" style="margin-top:6px"><input id="rn_${id}" placeholder="new name" style="flex:1" /><button class="alt" onclick="renameItem('${encodeURIComponent(it.rel_path)}','rn_${id}')">Rename</button></div><div class="row" style="margin-top:6px"><input id="rp_${id}" type="file" accept=".png,.jpg,.jpeg,.webp" style="flex:1" /><button class="alt" onclick="replaceItem('${encodeURIComponent(it.rel_path)}','rp_${id}')">Replace</button><button class="danger" onclick="deleteItem('${encodeURIComponent(it.rel_path)}')">Delete</button></div></div>`;
+    root.appendChild(tile);
+  });
+}
+
+async function moveItem(rel, inputId) { const nc = document.getElementById(inputId).value || "all"; const fd = new FormData(); fd.append("rel_path", decodeURIComponent(rel)); fd.append("new_category", nc); const r = await api("/api/gallery/move", { method: "POST", body: fd }); if (!r.ok) { msg("Move failed: " + r.status); return; } await loadCategories(); await loadItems(pageState.page); msg("Moved.", true); }
+async function moveSelected() { const arr = Array.from(checked.values()); if (!arr.length) { msg("No selection."); return; } const nc = document.getElementById("bulkMoveTo").value || "all"; const r = await api("/api/gallery/move_many", { method: "POST", body: JSON.stringify({ rel_paths: arr, new_category: nc }) }); if (!r.ok) { msg("Batch move failed: " + r.status); return; } await loadCategories(); await loadItems(pageState.page); msg("Batch move done.", true); }
+async function deleteItem(rel) { if (!confirm("Delete image?")) return; const r = await api(`/api/gallery/item?rel_path=${rel}`, { method: "DELETE" }); if (!r.ok) { msg("Delete failed: " + r.status); return; } await loadCategories(); await loadItems(pageState.page); msg("Deleted.", true); }
+async function deleteSelected() { const arr = Array.from(checked.values()); if (!arr.length) { msg("No selection."); return; } if (!confirm(`Delete ${arr.length} images?`)) return; const r = await api("/api/gallery/delete_many", { method: "POST", body: JSON.stringify({ rel_paths: arr }) }); if (!r.ok) { msg("Batch delete failed: " + r.status); return; } await loadCategories(); await loadItems(pageState.page); msg("Batch delete done.", true); }
+async function renameItem(rel, id) { const nv = (document.getElementById(id).value || "").trim(); if (!nv) { msg("Enter new name."); return; } const fd = new FormData(); fd.append("rel_path", decodeURIComponent(rel)); fd.append("new_name", nv); const r = await api("/api/gallery/rename", { method: "POST", body: fd }); if (!r.ok) { msg("Rename failed: " + r.status); return; } await loadItems(pageState.page); msg("Renamed.", true); }
+async function replaceItem(rel, id) { const el = document.getElementById(id); if (!el || !el.files || !el.files[0]) { msg("Choose replacement file."); return; } const fd = new FormData(); fd.append("rel_path", decodeURIComponent(rel)); fd.append("file", el.files[0]); const r = await api("/api/gallery/replace", { method: "POST", body: fd }); if (!r.ok) { msg("Replace failed: " + r.status); return; } await loadItems(pageState.page); msg("Replaced.", true); }
+
+function updateUploadInfo() { document.getElementById("uploadInfo").textContent = `${selectedFiles.length} files selected`; }
+function clearPickedFiles() {
+  selectedFiles = [];
+  const fi = document.getElementById("filesInput");
+  const fol = document.getElementById("folderInput");
+  if (fi) fi.value = "";
+  if (fol) fol.value = "";
+  updateUploadInfo();
+}
+function pickFilesFromInput(input) { selectedFiles = Array.from((input.files || [])).filter((f) => /\.(png|jpg|jpeg|webp)$/i.test(f.name)); updateUploadInfo(); }
+
+async function uploadSelected() {
+  if (uploadInProgress) return;
+  if (!selectedFiles.length) { msg("No files selected."); return; }
+  const btn = document.getElementById("uploadBtn");
+  const beforeText = btn ? btn.textContent : "";
+  uploadInProgress = true;
+  if (btn) { btn.disabled = true; btn.textContent = "Uploading..."; }
+  let created = 0, duplicate = 0, fail = 0;
+  try {
+    for (const f of selectedFiles) {
+      const fd = new FormData();
+      fd.append("file", f);
+      fd.append("category", currentCategory || "all");
+      try {
+        const r = await api("/api/menu/upload_image", { method: "POST", body: fd });
+        if (!r.ok) { fail += 1; continue; }
+        let j = {};
+        try { j = await r.json(); } catch (_) { j = {}; }
+        if (j && j.duplicate) duplicate += 1; else created += 1;
+      } catch (_) {
+        fail += 1;
+      }
+    }
+    clearPickedFiles();
+    await loadCategories();
+    await loadItems(pageState.page);
+    msg(`Upload complete. New=${created}, Duplicate=${duplicate}, Fail=${fail}`, fail === 0);
+    await loadTop("selected");
+  } finally {
+    uploadInProgress = false;
+    if (btn) { btn.disabled = false; btn.textContent = beforeText || "Upload Selected"; }
+  }
+}
+
+function setupDrop() {
+  const dz = document.getElementById("dropZone");
+  dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.style.background = "#ecfeff"; });
+  dz.addEventListener("dragleave", () => { dz.style.background = "#f8fbff"; });
+  dz.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dz.style.background = "#f8fbff";
+    selectedFiles = Array.from(e.dataTransfer.files || []).filter((f) => /\.(png|jpg|jpeg|webp)$/i.test(f.name));
+    updateUploadInfo();
+  });
+}
+
+async function loadTop(metric = "selected") {
+  const m = metric === "downloaded" ? "downloaded" : "selected";
+  const r = await api(`/api/gallery/stats/top?metric=${encodeURIComponent(m)}&limit=10`);
+  if (!r.ok) { msg("Load top stats failed: " + r.status); return; }
+  const j = await r.json();
+  const arr = Array.isArray(j.items) ? j.items : [];
+  const root = document.getElementById("topList");
+  if (!arr.length) { root.innerHTML = "<div class='muted'>No stats yet.</div>"; return; }
+  root.innerHTML = arr.map((it, i) => {
+    const c = m === "downloaded" ? Number(it.downloaded_count || 0) : Number(it.selected_count || 0);
+    return `<div class="row" style="justify-content:space-between;padding:5px 0;border-bottom:1px solid #eef2f7"><span>${i + 1}. ${esc(it.rel_path || "")}</span><b>${c}</b></div>`;
+  }).join("");
+}
+
+async function bootstrap() {
+  authUser = await authCheck();
+  renderAuth();
+  if (!authUser) return;
+  await loadBrand();
+  await loadCategories();
+  await loadItems(1);
+  await loadTop("selected");
+  if (authUser.role === "admin") await loadUsers();
+  msg("Ready.", true);
+}
+
+document.getElementById("filesInput").addEventListener("change", (e) => pickFilesFromInput(e.target));
+document.getElementById("folderInput").addEventListener("change", (e) => pickFilesFromInput(e.target));
+setupDrop();
+bootstrap();
 </script>
 </body></html>"""
         from fastapi.responses import HTMLResponse
@@ -7138,4 +7642,6 @@ if __name__ == "__main__":
         uvicorn.run(app, host="0.0.0.0", port=_PUBLIC_PORT, ssl_certfile=_cert, ssl_keyfile=_key, log_level="info")
     else:
         uvicorn.run(app, host="0.0.0.0", port=_PUBLIC_PORT, log_level="info")
+
+
 
