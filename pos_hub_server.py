@@ -5903,7 +5903,10 @@ const PRE_LOGIN_NOTICE = __PRE_LOGIN_NOTICE__;
 const PRE_BOOTSTRAP_TOKEN = __PRE_BOOTSTRAP_TOKEN__;
 let sessionFallbackToken = "";
 const pageState = { page: 1, totalPages: 1, total: 0 };
-const esc = (s) => String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
+const esc = (s) => {
+  const x = String(s || "");
+  return x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+};
 const msg = (t, ok = false) => { const m = document.getElementById("msg"); m.textContent = t || ""; m.style.color = ok ? "#065f46" : "#b91c1c"; };
 const loginMsg = (t, kind = "error") => {
   const m = document.getElementById("loginMsg");
