@@ -1399,6 +1399,7 @@ def create_app(
 
     # Gallery admin auth/session/user management.
     _gallery_sessions: dict[str, dict] = {}
+    _gallery_revoked_sessions: dict[str, float] = {}
     _GALLERY_COOKIE = "gallery_admin_session"
     _GALLERY_TTL_SEC = int(_env_int("POS_HUB_GALLERY_SESSION_TTL_SEC", 12 * 3600, 900, 7 * 24 * 3600))
     _GALLERY_ROLE_RANK = {"editor": 10, "admin": 20}
@@ -1819,17 +1820,55 @@ def create_app(
         dead = [k for k, v in _gallery_sessions.items() if float((v or {}).get("exp") or 0.0) <= t]
         for k in dead:
             _gallery_sessions.pop(k, None)
+        dead_revoked = [k for k, exp in _gallery_revoked_sessions.items() if float(exp or 0.0) <= t]
+        for k in dead_revoked:
+            _gallery_revoked_sessions.pop(k, None)
+
+    def _gallery_session_secret() -> str:
+        # Per-feature secret override; falls back to JWT secret.
+        s = str(os.environ.get("POS_HUB_GALLERY_SESSION_SECRET", "") or "").strip()
+        if s:
+            return s
+        return _jwt_secret()
+
+    def _gallery_session_sign(payload: dict) -> str:
+        p_b64 = _b64url_encode(_json_dumps(payload).encode("utf-8"))
+        msg = f"g1.{p_b64}".encode("utf-8")
+        sig = hmac.new(_gallery_session_secret().encode("utf-8"), msg, hashlib.sha256).digest()
+        return f"g1.{p_b64}.{_b64url_encode(sig)}"
+
+    def _gallery_session_unsign(token: str) -> Optional[dict]:
+        tok = str(token or "").strip()
+        if not tok.startswith("g1."):
+            return None
+        parts = tok.split(".")
+        if len(parts) != 3:
+            return None
+        _, p_b64, s_b64 = parts
+        try:
+            got_sig = _b64url_decode(s_b64)
+            msg = f"g1.{p_b64}".encode("utf-8")
+            exp_sig = hmac.new(_gallery_session_secret().encode("utf-8"), msg, hashlib.sha256).digest()
+            if not hmac.compare_digest(got_sig, exp_sig):
+                return None
+            payload_raw = _b64url_decode(p_b64)
+            v = json.loads(payload_raw.decode("utf-8"))
+            if not isinstance(v, dict):
+                return None
+            return v
+        except Exception:
+            return None
 
     def _gallery_session_issue(username: str, role: str = "editor", display_name: str = "") -> tuple[str, float]:
         _gallery_session_purge()
-        tok = secrets.token_urlsafe(32)
         exp = float(time.time() + _GALLERY_TTL_SEC)
-        _gallery_sessions[tok] = {
+        row = {
             "exp": exp,
             "username": str(username or "").strip().lower(),
             "role": str(role or "editor").strip().lower(),
             "display_name": str(display_name or "").strip(),
         }
+        tok = _gallery_session_sign(row)
         return tok, exp
 
     def _gallery_session_check(request: Request) -> Optional[dict]:
@@ -1840,12 +1879,22 @@ def create_app(
             tok = ""
         if not tok:
             return None
-        row = _gallery_sessions.get(tok) or {}
-        exp = float(row.get("exp") or 0.0)
-        if exp <= float(time.time()):
+        if tok in _gallery_revoked_sessions:
+            return None
+        # Primary path: signed stateless cookie (works across instances/workers).
+        row = _gallery_session_unsign(tok)
+        if row:
+            exp = float(row.get("exp") or 0.0)
+            if exp <= float(time.time()):
+                return None
+            return dict(row)
+        # Legacy fallback: old in-memory session token.
+        row2 = _gallery_sessions.get(tok) or {}
+        exp2 = float(row2.get("exp") or 0.0)
+        if exp2 <= float(time.time()):
             _gallery_sessions.pop(tok, None)
             return None
-        return dict(row)
+        return dict(row2)
 
     def _gallery_require_role(auth_obj: dict, need: str = "editor"):
         need_rank = int(_GALLERY_ROLE_RANK.get(str(need or "editor"), 10))
@@ -5676,6 +5725,9 @@ def create_app(
         try:
             tok = str(request.cookies.get(_GALLERY_COOKIE) or "").strip()
             if tok:
+                row = _gallery_session_unsign(tok) or (_gallery_sessions.get(tok) or {})
+                exp = float((row or {}).get("exp") or (time.time() + _GALLERY_TTL_SEC))
+                _gallery_revoked_sessions[tok] = exp
                 _gallery_sessions.pop(tok, None)
         except Exception:
             pass
@@ -5712,6 +5764,17 @@ def create_app(
                     "kind": "error",
                 }
         pre_login_notice_json = _json_dumps(pre_login_notice)
+        pre_login_notice_text_html = (
+            str(pre_login_notice.get("text") or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        pre_login_notice_kind = str(pre_login_notice.get("kind") or "info")
+        if pre_login_notice_text_html:
+            pre_login_notice_class = f"login-status {pre_login_notice_kind}"
+        else:
+            pre_login_notice_class = "login-status hidden"
         html = """<!doctype html>
 <html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Company Media Admin</title>
@@ -5777,6 +5840,7 @@ button{cursor:pointer;border:0;background:var(--dark);color:#fff}button.ok{backg
       </form>
     </div>
   </div>
+  <div id="serverLoginNotice" class="__PRE_LOGIN_NOTICE_CLASS__">__PRE_LOGIN_NOTICE_TEXT__</div>
   <div id="loginMsg" class="login-status hidden" role="status" aria-live="polite"></div>
 </div>
 <div id="appArea" class="hidden"><div class="toolbar card" style="margin-top:12px;"><span id="who" class="muted"></span><button class="alt" onclick="bootstrap()">Reload</button><button class="danger" onclick="logout()">Logout</button><span id="statsTop" class="muted"></span></div>
@@ -6171,6 +6235,8 @@ bootstrap();
 </script>
 </body></html>"""
         html = html.replace("__PRE_LOGIN_NOTICE__", pre_login_notice_json)
+        html = html.replace("__PRE_LOGIN_NOTICE_TEXT__", pre_login_notice_text_html)
+        html = html.replace("__PRE_LOGIN_NOTICE_CLASS__", pre_login_notice_class)
         from fastapi.responses import HTMLResponse
         r = HTMLResponse(content=html)
         r.headers["Cache-Control"] = "no-store"
