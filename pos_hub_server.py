@@ -1492,6 +1492,12 @@ def create_app(
                         ts,
                     ),
                 )
+            admin_user_env = str(os.environ.get("POS_HUB_GALLERY_ADMIN_USER", "admin") or "admin").strip().lower()
+            admin_pwd_env = str(os.environ.get("POS_HUB_GALLERY_ADMIN_PASSWORD", "") or "").strip()
+            force_admin_reset = str(os.environ.get("POS_HUB_GALLERY_ADMIN_FORCE_RESET", "") or "").strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+
             # Bootstrap one admin user.
             c = con.execute("SELECT COUNT(*) AS n FROM gallery_admin_users").fetchone()
             existing_users = 0
@@ -1501,8 +1507,8 @@ def create_app(
             except Exception:
                 existing_users = 0
             if existing_users <= 0:
-                u = str(os.environ.get("POS_HUB_GALLERY_ADMIN_USER", "admin") or "admin").strip().lower()
-                p = str(os.environ.get("POS_HUB_GALLERY_ADMIN_PASSWORD", "") or "").strip()
+                u = admin_user_env
+                p = admin_pwd_env
                 if not p:
                     p = str(api_key or "").strip()
                     if p:
@@ -1516,6 +1522,27 @@ def create_app(
                     "INSERT INTO gallery_admin_users(username,display_name,role,pwd_hash,pwd_salt,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                     (u, "Owner", "admin", h, s, 1, ts, ts),
                 )
+            elif force_admin_reset:
+                if not admin_pwd_env:
+                    log.warning("[gallery-admin] POS_HUB_GALLERY_ADMIN_FORCE_RESET is set but POS_HUB_GALLERY_ADMIN_PASSWORD is empty; skipping reset.")
+                else:
+                    h, s = _gallery_pwd_hash(admin_pwd_env)
+                    ts = _now()
+                    con.execute(
+                        """
+                        INSERT INTO gallery_admin_users(username,display_name,role,pwd_hash,pwd_salt,active,created_at,updated_at,last_login_at)
+                        VALUES(?,?,?,?,?,?,?,?,NULL)
+                        ON CONFLICT(username) DO UPDATE SET
+                            display_name=excluded.display_name,
+                            role=excluded.role,
+                            pwd_hash=excluded.pwd_hash,
+                            pwd_salt=excluded.pwd_salt,
+                            active=1,
+                            updated_at=excluded.updated_at
+                        """,
+                        (admin_user_env, "Owner", "admin", h, s, 1, ts, ts),
+                    )
+                    log.warning("[gallery-admin] forced admin password reset applied for user '%s'.", admin_user_env)
             con.commit()
         finally:
             con.close()
@@ -2208,6 +2235,29 @@ def create_app(
             }
         finally:
             con.close()
+
+    def _auth_api_key_recovery(raw_key: Optional[str]) -> dict:
+        """
+        API-key validation path that intentionally ignores POS_HUB_AUTH_MODE.
+        Used by gallery-admin recovery login.
+        """
+        received_raw = raw_key
+        received = _norm_key(received_raw)
+        expected = _norm_key(api_key)
+        if received and received == expected:
+            return {"kind": "legacy_api_key", "tenant_id": "", "location_id": "", "sub": "legacy"}
+        tkey_obj = _load_active_api_key_tenant(received)
+        if tkey_obj is not None:
+            return tkey_obj
+        log.warning(
+            "AUTH FAIL (gallery recovery): got value=%s len=%d mask=%s | expected len=%d mask=%s",
+            "present" if received_raw is not None else "missing",
+            len(received),
+            _mask_key(received),
+            len(expected),
+            _mask_key(expected),
+        )
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key")
 
     def _auth(x_api_key: Optional[str]) -> dict:
         mode = _auth_mode()
@@ -5543,14 +5593,27 @@ def create_app(
             username = str(payload.get("username") or "").strip().lower()
             password = str(payload.get("password") or "").strip()
             raw_key = str(payload.get("api_key") or payload.get("apiKey") or "").strip()
+        client_ip = ""
+        try:
+            client_ip = str((request.client.host if request.client else "") or "")
+        except Exception:
+            client_ip = ""
+        login_subject = username or ("api_key" if raw_key else "anon")
+        _rate_limit_guard(
+            f"gallery_login:{client_ip}:{login_subject}",
+            max_hits=min(12, int(app.state.rate_limit_auth_max)),
+            window_sec=int(app.state.rate_limit_auth_window),
+        )
         role = "editor"
         display_name = ""
         user_for_session = ""
         if username and password:
             u = _gallery_user_get(username)
             if not u or int(u.get("active") or 0) != 1:
+                log.warning("[gallery-admin] invalid credentials user='%s' ip='%s'", username, client_ip or "-")
                 raise HTTPException(status_code=401, detail="invalid credentials")
             if not _gallery_pwd_verify(password, str(u.get("pwd_hash") or ""), str(u.get("pwd_salt") or "")):
+                log.warning("[gallery-admin] invalid credentials user='%s' ip='%s'", username, client_ip or "-")
                 raise HTTPException(status_code=401, detail="invalid credentials")
             user_for_session = str(u.get("username") or username).strip().lower()
             display_name = str(u.get("display_name") or "").strip()
@@ -5565,7 +5628,7 @@ def create_app(
             finally:
                 con.close()
         elif raw_key:
-            _auth(raw_key)  # recovery/admin fallback
+            _auth_api_key_recovery(raw_key)  # recovery/admin fallback, independent from auth mode
             user_for_session = "api_key"
             display_name = "API Key"
             role = "admin"
@@ -5634,20 +5697,71 @@ button{cursor:pointer;border:0;background:var(--dark);color:#fff}button.ok{backg
 .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
 .tile{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#fff}.img{width:100%;height:160px;object-fit:cover;background:#e2e8f0}.meta{padding:8px;font-size:12px}
 .name{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.small{color:var(--muted)}.msg{min-height:18px;font-size:13px}.muted{color:var(--muted);font-size:12px}.sep{height:1px;background:#eef2f7;margin:10px 0}.hidden{display:none !important}
-@media (max-width:1200px){.grid{grid-template-columns:1fr}}
+.login-shell{border-color:#cbd5e1;background:linear-gradient(145deg,#ffffff 0%,#f8fafc 55%,#ecfeff 100%);box-shadow:0 14px 28px rgba(15,23,42,.1)}
+.login-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px}
+.login-badge{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#0f766e;background:#e6fffb;border:1px solid #99f6e4;border-radius:999px;padding:5px 10px}
+.login-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.login-col{border:1px solid #dbe7f3;border-radius:10px;padding:10px;background:#fff}
+.input-wrap{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:9px;padding:8px 10px;background:#fff}
+.ghost-btn{background:#e2e8f0;color:#0f172a;border:0;padding:6px 10px;border-radius:8px}
+.cta{width:100%;margin-top:10px}
+.login-status{margin-top:10px;padding:10px 12px;border-radius:10px;font-size:13px}
+.login-status.error{background:#fef2f2;border:1px solid #fecaca;color:#991b1b}
+.login-status.ok{background:#ecfdf5;border:1px solid #bbf7d0;color:#166534}
+.login-status.info{background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8}
+@media (max-width:1200px){.grid{grid-template-columns:1fr}.login-grid{grid-template-columns:1fr}}
 </style></head>
 <body><div class="wrap"><div class="hero"><img id="brandLogo" class="logo" src="" alt="logo"><div><h1 id="brandName">Company Media Center</h1><p id="brandTag">Global gallery for all branches and customers</p></div></div>
-<div id="loginCard" class="card" style="margin-top:12px;max-width:520px;"><div class="title">Sign In</div><div class="row"><input id="loginUser" placeholder="Username" style="flex:1" /></div><div class="row" style="margin-top:8px"><input id="loginPass" type="password" placeholder="Password" style="flex:1" /></div><div class="row" style="margin-top:8px"><button class="ok" onclick="loginUserPass()">Login</button></div><div class="muted" style="margin-top:8px">Admin recovery: use API Key login</div><div class="row" style="margin-top:6px"><input id="loginApiKey" type="password" placeholder="API Key (recovery)" style="flex:1" /><button onclick="loginApiKey()">Login with API Key</button></div><div id="loginMsg" class="msg"></div></div>
+<div id="loginCard" class="card login-shell" style="margin-top:14px;max-width:680px;">
+  <div class="login-head">
+    <div>
+      <div class="title" style="margin:0">Secure Sign In</div>
+      <div class="muted" style="margin-top:4px">Use your team account or API key recovery access.</div>
+    </div>
+    <div class="login-badge">Protected</div>
+  </div>
+  <div class="login-grid">
+    <div class="login-col">
+      <label class="muted" for="loginUser">Username</label>
+      <input id="loginUser" placeholder="Username" autocomplete="username" spellcheck="false" autocapitalize="none" style="width:100%" />
+      <label class="muted" for="loginPass" style="margin-top:8px">Password</label>
+      <div class="input-wrap">
+        <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password" style="flex:1;border:0;outline:0;padding:0;background:transparent" />
+        <button id="togglePassBtn" type="button" class="ghost-btn" onclick="toggleLoginPassword()">Show</button>
+      </div>
+      <button id="loginBtn" class="ok cta" onclick="loginUserPass()">Sign In</button>
+    </div>
+    <div class="login-col">
+      <div class="muted">Recovery</div>
+      <div class="muted" style="margin-top:4px">If password access fails, sign in with your API key and rotate credentials.</div>
+      <label class="muted" for="loginApiKey" style="margin-top:8px">API key</label>
+      <input id="loginApiKey" type="password" placeholder="API Key (recovery)" autocomplete="off" spellcheck="false" style="width:100%" />
+      <button id="apiLoginBtn" class="alt cta" onclick="loginApiKey()">Login with API Key</button>
+    </div>
+  </div>
+  <div id="loginMsg" class="login-status hidden" role="status" aria-live="polite"></div>
+</div>
 <div id="appArea" class="hidden"><div class="toolbar card" style="margin-top:12px;"><span id="who" class="muted"></span><button class="alt" onclick="bootstrap()">Reload</button><button class="danger" onclick="logout()">Logout</button><span id="statsTop" class="muted"></span></div>
 <div class="grid"><div><div class="card"><div class="title">Categories</div><div class="row"><input id="newCat" placeholder="new category" style="flex:1" /><button class="ok" onclick="createCategory()">Create</button></div><div class="row" style="margin-top:8px"><select id="moveToCat" style="flex:1"></select><button class="danger" onclick="deleteCategory()">Delete</button></div><div class="row" style="margin-top:6px"><button class="alt" onclick="moveCategory(-1)">Move Up</button><button class="alt" onclick="moveCategory(1)">Move Down</button></div><div class="cats" id="catList" style="margin-top:8px"></div></div><div class="card" style="margin-top:10px;"><div class="title">Upload</div><input id="filesInput" type="file" accept=".png,.jpg,.jpeg,.webp" multiple /><div style="margin-top:6px"><input id="folderInput" type="file" webkitdirectory directory multiple /></div><div class="drop" id="dropZone" style="margin-top:8px">Drop image files/folders here</div><div class="row" style="margin-top:8px"><button class="ok" id="uploadBtn" onclick="uploadSelected()">Upload Selected</button><span id="uploadInfo" class="muted">0 files selected</span></div></div></div>
 <div class="card"><div class="toolbar"><div class="title" style="margin:0">Images</div><input id="search" placeholder="search..." oninput="loadItems(1)" /><button onclick="loadItems(pageState.page)">Refresh</button><select id="bulkMoveTo"></select><button class="alt" onclick="moveSelected()">Move Selected</button><button class="danger" onclick="deleteSelected()">Delete Selected</button><button class="alt" onclick="selectAllVisible()">Select Page</button><button class="alt" onclick="clearSelection()">Clear</button></div><div id="msg" class="msg"></div><div id="gallery" class="gallery"></div><div class="toolbar" style="margin-top:8px;"><button class="alt" onclick="prevPage()">Prev</button><span id="pager" class="muted"></span><button class="alt" onclick="nextPage()">Next</button><select id="pageSize" onchange="loadItems(1)"><option>60</option><option selected>120</option><option>240</option></select></div></div>
 <div><div class="card"><div class="title">Branding</div><input id="bName" placeholder="Company name" /><div style="margin-top:6px"><input id="bTag" placeholder="Tagline" /></div><div style="margin-top:6px"><input id="bLogo" placeholder="Logo URL (https://...)" /></div><div style="margin-top:6px"><textarea id="bAbout" placeholder="About text"></textarea></div><div class="row"><button class="ok" id="saveBrandBtn" onclick="saveBrand()">Save Branding</button></div></div><div id="usersCard" class="card" style="margin-top:10px;"><div class="title">Team Access</div><div class="row"><input id="uUser" placeholder="username" style="flex:1" /><select id="uRole"><option value="editor">editor</option><option value="admin">admin</option></select></div><div style="margin-top:6px"><input id="uName" placeholder="display name" /></div><div style="margin-top:6px"><input id="uPass" type="password" placeholder="password (new or change)" /></div><div class="row" style="margin-top:6px"><label><input id="uActive" type="checkbox" checked /> active</label><button class="ok" onclick="saveUser()">Save User</button></div><div class="sep"></div><div id="usersList" class="muted"></div></div><div class="card" style="margin-top:10px;"><div class="title">Top 10 Stats</div><div class="row"><button class="alt" onclick="loadTop('selected')">Top Selected</button><button class="alt" onclick="loadTop('downloaded')">Top Downloaded</button></div><div id="topList" class="muted" style="margin-top:8px"></div></div></div></div></div></div>
 <script>
-let categories = [], items = [], currentCategory = "all", selectedFiles = [], checked = new Set(), authUser = null, uploadInProgress = false;
+let categories = [], items = [], currentCategory = "all", selectedFiles = [], checked = new Set(), authUser = null, uploadInProgress = false, loginBusy = false;
 const pageState = { page: 1, totalPages: 1, total: 0 };
 const esc = (s) => String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
 const msg = (t, ok = false) => { const m = document.getElementById("msg"); m.textContent = t || ""; m.style.color = ok ? "#065f46" : "#b91c1c"; };
-const loginMsg = (t, ok = false) => { const m = document.getElementById("loginMsg"); m.textContent = t || ""; m.style.color = ok ? "#065f46" : "#b91c1c"; };
+const loginMsg = (t, kind = "error") => {
+  const m = document.getElementById("loginMsg");
+  if (!m) return;
+  const text = String(t || "").trim();
+  if (!text) {
+    m.textContent = "";
+    m.className = "login-status hidden";
+    return;
+  }
+  m.textContent = text;
+  m.className = "login-status " + (kind === "ok" ? "ok" : (kind === "info" ? "info" : "error"));
+};
 const hsize = (n) => { n = Number(n || 0); if (n < 1024) return n + " B"; if (n < 1048576) return (n / 1024).toFixed(1) + " KB"; return (n / 1048576).toFixed(1) + " MB"; };
 
 async function api(url, opt = {}) {
@@ -5655,17 +5769,84 @@ async function api(url, opt = {}) {
   o.credentials = "include";
   if (o.body && !(o.body instanceof FormData)) o.headers = Object.assign({ "Content-Type": "application/json" }, o.headers || {});
   const res = await fetch(url, o);
-  if (res.status === 401) {
+  const requestPath = String(url || "");
+  if (res.status === 401 && requestPath.indexOf("/gallery-admin/login") < 0) {
     authUser = null;
     renderAuth();
-    loginMsg("Session expired. Please login again.");
+    loginMsg("Session expired. Please login again.", "info");
   }
   return res;
 }
 
+function setLoginBusy(on) {
+  loginBusy = !!on;
+  ["loginUser", "loginPass", "loginApiKey", "loginBtn", "apiLoginBtn", "togglePassBtn"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = loginBusy;
+  });
+  const loginBtn = document.getElementById("loginBtn");
+  const apiBtn = document.getElementById("apiLoginBtn");
+  if (loginBtn) loginBtn.textContent = loginBusy ? "Signing in..." : "Sign In";
+  if (apiBtn) apiBtn.textContent = loginBusy ? "Please wait..." : "Login with API Key";
+}
+
+function toggleLoginPassword() {
+  const p = document.getElementById("loginPass");
+  const b = document.getElementById("togglePassBtn");
+  if (!p || !b) return;
+  const show = p.type === "password";
+  p.type = show ? "text" : "password";
+  b.textContent = show ? "Hide" : "Show";
+}
+
 async function authCheck() { const r = await api("/gallery-admin/me"); if (!r.ok) return null; const j = await r.json(); return j && j.ok ? j.user : null; }
-async function loginUserPass() { const u = (document.getElementById("loginUser").value || "").trim(); const p = (document.getElementById("loginPass").value || "").trim(); if (!u || !p) { loginMsg("Enter username and password."); return; } const r = await api("/gallery-admin/login", { method: "POST", body: JSON.stringify({ username: u, password: p }) }); if (!r.ok) { loginMsg("Login failed: " + r.status); return; } await bootstrap(); }
-async function loginApiKey() { const k = (document.getElementById("loginApiKey").value || "").trim(); if (!k) { loginMsg("Enter api key"); return; } const r = await api("/gallery-admin/login", { method: "POST", body: JSON.stringify({ api_key: k }) }); if (!r.ok) { loginMsg("API key login failed: " + r.status); return; } await bootstrap(); }
+async function loginErrorText(res) { try { const j = await res.json(); if (j && typeof j.detail === "string" && j.detail.trim()) return j.detail.trim(); } catch (_) {} return "HTTP " + res.status; }
+async function loginUserPass() {
+  if (loginBusy) return;
+  const u = (document.getElementById("loginUser").value || "").trim();
+  const p = (document.getElementById("loginPass").value || "").trim();
+  if (!u || !p) { loginMsg("Enter username and password.", "error"); return; }
+  setLoginBusy(true);
+  loginMsg("Verifying credentials...", "info");
+  try {
+    const r = await api("/gallery-admin/login", { method: "POST", body: JSON.stringify({ username: u, password: p }) });
+    if (!r.ok) { loginMsg("Login failed: " + await loginErrorText(r), "error"); return; }
+    await bootstrap();
+    if (!authUser) {
+      loginMsg("Login succeeded but session cookie is blocked. Allow cookies for this site.", "error");
+      return;
+    }
+    document.getElementById("loginPass").value = "";
+    loginMsg("Login successful.", "ok");
+  } catch (_) {
+    loginMsg("Network error while signing in. Please retry.", "error");
+  } finally {
+    setLoginBusy(false);
+  }
+}
+
+async function loginApiKey() {
+  if (loginBusy) return;
+  const k = (document.getElementById("loginApiKey").value || "").trim();
+  if (!k) { loginMsg("Enter api key.", "error"); return; }
+  setLoginBusy(true);
+  loginMsg("Verifying API key...", "info");
+  try {
+    const r = await api("/gallery-admin/login", { method: "POST", body: JSON.stringify({ api_key: k }) });
+    if (!r.ok) { loginMsg("API key login failed: " + await loginErrorText(r), "error"); return; }
+    await bootstrap();
+    if (!authUser) {
+      loginMsg("Login succeeded but session cookie is blocked. Allow cookies for this site.", "error");
+      return;
+    }
+    document.getElementById("loginApiKey").value = "";
+    loginMsg("Recovery login successful.", "ok");
+  } catch (_) {
+    loginMsg("Network error while signing in. Please retry.", "error");
+  } finally {
+    setLoginBusy(false);
+  }
+}
 async function logout() { await api("/gallery-admin/logout", { method: "POST" }); authUser = null; renderAuth(); }
 
 function renderAuth() {
@@ -5918,12 +6099,22 @@ async function bootstrap() {
 
 document.getElementById("filesInput").addEventListener("change", (e) => pickFilesFromInput(e.target));
 document.getElementById("folderInput").addEventListener("change", (e) => pickFilesFromInput(e.target));
+document.getElementById("loginUser").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loginUserPass(); } });
+document.getElementById("loginPass").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loginUserPass(); } });
+document.getElementById("loginApiKey").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loginApiKey(); } });
 setupDrop();
 bootstrap();
 </script>
 </body></html>"""
         from fastapi.responses import HTMLResponse
-        return HTMLResponse(content=html)
+        r = HTMLResponse(content=html)
+        r.headers["Cache-Control"] = "no-store"
+        r.headers["X-Content-Type-Options"] = "nosniff"
+        r.headers["X-Frame-Options"] = "DENY"
+        r.headers["Referrer-Policy"] = "same-origin"
+        r.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        r.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        return r
 
     # ---- Health ----
     @app.get("/health")
