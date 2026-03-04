@@ -5727,16 +5727,16 @@ button{cursor:pointer;border:0;background:var(--dark);color:#fff}button.ok{backg
       <label class="muted" for="loginPass" style="margin-top:8px">Password</label>
       <div class="input-wrap">
         <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password" style="flex:1;border:0;outline:0;padding:0;background:transparent" />
-        <button id="togglePassBtn" type="button" class="ghost-btn" onclick="toggleLoginPassword()">Show</button>
+        <button id="togglePassBtn" type="button" class="ghost-btn">Show</button>
       </div>
-      <button id="loginBtn" class="ok cta" onclick="loginUserPass()">Sign In</button>
+      <button id="loginBtn" type="button" class="ok cta">Sign In</button>
     </div>
     <div class="login-col">
       <div class="muted">Recovery</div>
       <div class="muted" style="margin-top:4px">If password access fails, sign in with your API key and rotate credentials.</div>
       <label class="muted" for="loginApiKey" style="margin-top:8px">API key</label>
       <input id="loginApiKey" type="password" placeholder="API Key (recovery)" autocomplete="off" spellcheck="false" style="width:100%" />
-      <button id="apiLoginBtn" class="alt cta" onclick="loginApiKey()">Login with API Key</button>
+      <button id="apiLoginBtn" type="button" class="alt cta">Login with API Key</button>
     </div>
   </div>
   <div id="loginMsg" class="login-status hidden" role="status" aria-live="polite"></div>
@@ -6099,9 +6099,19 @@ async function bootstrap() {
 
 document.getElementById("filesInput").addEventListener("change", (e) => pickFilesFromInput(e.target));
 document.getElementById("folderInput").addEventListener("change", (e) => pickFilesFromInput(e.target));
+document.getElementById("togglePassBtn").addEventListener("click", () => toggleLoginPassword());
+document.getElementById("loginBtn").addEventListener("click", () => loginUserPass());
+document.getElementById("apiLoginBtn").addEventListener("click", () => loginApiKey());
 document.getElementById("loginUser").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loginUserPass(); } });
 document.getElementById("loginPass").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loginUserPass(); } });
 document.getElementById("loginApiKey").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loginApiKey(); } });
+window.addEventListener("error", (e) => {
+  const txt = String((e && e.message) || "").trim() || "Unexpected page error.";
+  loginMsg("Client error: " + txt, "error");
+});
+window.addEventListener("unhandledrejection", () => {
+  loginMsg("Client error: unhandled async failure.", "error");
+});
 setupDrop();
 bootstrap();
 </script>
