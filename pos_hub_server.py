@@ -1402,6 +1402,7 @@ def create_app(
     _gallery_revoked_sessions: dict[str, float] = {}
     _GALLERY_COOKIE = "gallery_admin_session"
     _GALLERY_TTL_SEC = int(_env_int("POS_HUB_GALLERY_SESSION_TTL_SEC", 12 * 3600, 900, 7 * 24 * 3600))
+    _GALLERY_BOOTSTRAP_TTL_SEC = int(_env_int("POS_HUB_GALLERY_BOOTSTRAP_TTL_SEC", 300, 30, 3600))
     _GALLERY_ROLE_RANK = {"editor": 10, "admin": 20}
 
     def _gallery_pwd_hash(password: str, salt_hex: Optional[str] = None) -> tuple[str, str]:
@@ -1859,6 +1860,41 @@ def create_app(
         except Exception:
             return None
 
+    def _gallery_bootstrap_sign(session_token: str) -> str:
+        payload = {
+            "tok": str(session_token or "").strip(),
+            "exp": float(time.time() + _GALLERY_BOOTSTRAP_TTL_SEC),
+            "jti": secrets.token_urlsafe(8),
+        }
+        p_b64 = _b64url_encode(_json_dumps(payload).encode("utf-8"))
+        msg = f"gb1.{p_b64}".encode("utf-8")
+        sig = hmac.new(_gallery_session_secret().encode("utf-8"), msg, hashlib.sha256).digest()
+        return f"gb1.{p_b64}.{_b64url_encode(sig)}"
+
+    def _gallery_bootstrap_unsign(token: str) -> str:
+        tok = str(token or "").strip()
+        if not tok.startswith("gb1."):
+            return ""
+        parts = tok.split(".")
+        if len(parts) != 3:
+            return ""
+        _, p_b64, s_b64 = parts
+        try:
+            got_sig = _b64url_decode(s_b64)
+            msg = f"gb1.{p_b64}".encode("utf-8")
+            exp_sig = hmac.new(_gallery_session_secret().encode("utf-8"), msg, hashlib.sha256).digest()
+            if not hmac.compare_digest(got_sig, exp_sig):
+                return ""
+            payload_raw = _b64url_decode(p_b64)
+            v = json.loads(payload_raw.decode("utf-8"))
+            if not isinstance(v, dict):
+                return ""
+            if float(v.get("exp") or 0.0) <= float(time.time()):
+                return ""
+            return str(v.get("tok") or "").strip()
+        except Exception:
+            return ""
+
     def _gallery_session_issue(username: str, role: str = "editor", display_name: str = "") -> tuple[str, float]:
         _gallery_session_purge()
         exp = float(time.time() + _GALLERY_TTL_SEC)
@@ -1877,6 +1913,11 @@ def create_app(
             tok = str(request.cookies.get(_GALLERY_COOKIE) or "").strip()
         except Exception:
             tok = ""
+        if not tok:
+            try:
+                tok = str(request.headers.get("x-gallery-session") or "").strip()
+            except Exception:
+                tok = ""
         if not tok:
             return None
         if tok in _gallery_revoked_sessions:
@@ -5702,12 +5743,14 @@ def create_app(
             return _login_fail(400, "username/password or api_key required")
         token, exp = _gallery_session_issue(user_for_session, role=role, display_name=display_name)
         if wants_html_redirect:
-            r = RedirectResponse(url="/gallery-admin?login_result=ok", status_code=303)
+            lb = _gallery_bootstrap_sign(token)
+            r = RedirectResponse(url=f"/gallery-admin?login_result=ok&lb={quote(lb)}", status_code=303)
         else:
             r = JSONResponse({
                 "ok": True,
                 "expires_at": int(exp),
                 "user": {"username": user_for_session, "display_name": display_name, "role": role},
+                "session_token": token,
             })
         r.set_cookie(
             key=_GALLERY_COOKIE,
@@ -5724,6 +5767,8 @@ def create_app(
     def gallery_admin_logout(request: Request):
         try:
             tok = str(request.cookies.get(_GALLERY_COOKIE) or "").strip()
+            if not tok:
+                tok = str(request.headers.get("x-gallery-session") or "").strip()
             if tok:
                 row = _gallery_session_unsign(tok) or (_gallery_sessions.get(tok) or {})
                 exp = float((row or {}).get("exp") or (time.time() + _GALLERY_TTL_SEC))
@@ -5753,17 +5798,22 @@ def create_app(
     def gallery_admin_page(request: Request):
         login_error = str(request.query_params.get("login_error") or "").strip()
         login_result = str(request.query_params.get("login_result") or "").strip().lower()
+        login_bootstrap = str(request.query_params.get("lb") or "").strip()
+        pre_bootstrap_token = _gallery_bootstrap_unsign(login_bootstrap)
         pre_login_notice = {"text": "", "kind": "info"}
         if login_error:
             pre_login_notice = {"text": f"Login failed: {login_error}", "kind": "error"}
+        elif login_bootstrap and not pre_bootstrap_token:
+            pre_login_notice = {"text": "Login token expired. Please sign in again.", "kind": "error"}
         elif login_result == "ok":
             # Form-submit fallback can succeed server-side but still fail on clients that block cookies.
-            if not _gallery_session_check(request):
+            if not _gallery_session_check(request) and not pre_bootstrap_token:
                 pre_login_notice = {
                     "text": "Login was accepted, but no session cookie was stored. Enable cookies for this site, then retry.",
                     "kind": "error",
                 }
         pre_login_notice_json = _json_dumps(pre_login_notice)
+        pre_bootstrap_token_json = _json_dumps(pre_bootstrap_token)
         pre_login_notice_text_html = (
             str(pre_login_notice.get("text") or "")
             .replace("&", "&amp;")
@@ -5850,6 +5900,8 @@ button{cursor:pointer;border:0;background:var(--dark);color:#fff}button.ok{backg
 <script>
 let categories = [], items = [], currentCategory = "all", selectedFiles = [], checked = new Set(), authUser = null, uploadInProgress = false, loginBusy = false;
 const PRE_LOGIN_NOTICE = __PRE_LOGIN_NOTICE__;
+const PRE_BOOTSTRAP_TOKEN = __PRE_BOOTSTRAP_TOKEN__;
+let sessionFallbackToken = "";
 const pageState = { page: 1, totalPages: 1, total: 0 };
 const esc = (s) => String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
 const msg = (t, ok = false) => { const m = document.getElementById("msg"); m.textContent = t || ""; m.style.color = ok ? "#065f46" : "#b91c1c"; };
@@ -5868,6 +5920,33 @@ const loginMsg = (t, kind = "error") => {
 if (PRE_LOGIN_NOTICE && PRE_LOGIN_NOTICE.text) {
   loginMsg(String(PRE_LOGIN_NOTICE.text || ""), String(PRE_LOGIN_NOTICE.kind || "info"));
 }
+
+function setSessionFallbackToken(token) {
+  sessionFallbackToken = String(token || "").trim();
+  try {
+    if (sessionFallbackToken) localStorage.setItem("gallery_admin_session_fallback", sessionFallbackToken);
+    else localStorage.removeItem("gallery_admin_session_fallback");
+  } catch (_) {}
+}
+
+function clearSessionFallbackToken() { setSessionFallbackToken(""); }
+
+function loadSessionFallbackToken() {
+  try { return String(localStorage.getItem("gallery_admin_session_fallback") || "").trim(); } catch (_) { return ""; }
+}
+
+if (typeof PRE_BOOTSTRAP_TOKEN === "string" && PRE_BOOTSTRAP_TOKEN.trim()) {
+  setSessionFallbackToken(PRE_BOOTSTRAP_TOKEN.trim());
+  try {
+    const u = new URL(window.location.href);
+    let dirty = false;
+    ["lb", "login_result", "login_error"].forEach((k) => { if (u.searchParams.has(k)) { u.searchParams.delete(k); dirty = true; } });
+    if (dirty) history.replaceState({}, "", u.pathname + (u.search || "") + (u.hash || ""));
+  } catch (_) {}
+} else {
+  setSessionFallbackToken(loadSessionFallbackToken());
+}
+
 window.addEventListener("error", (e) => {
   const txt = String((e && e.message) || "").trim() || "Unexpected page error.";
   loginMsg("Client error: " + txt, "error");
@@ -5880,11 +5959,13 @@ const hsize = (n) => { n = Number(n || 0); if (n < 1024) return n + " B"; if (n 
 async function api(url, opt = {}) {
   const o = Object.assign({}, opt || {});
   o.credentials = "include";
+  if (sessionFallbackToken) o.headers = Object.assign({}, o.headers || {}, { "X-Gallery-Session": sessionFallbackToken });
   if (o.body && !(o.body instanceof FormData)) o.headers = Object.assign({ "Content-Type": "application/json" }, o.headers || {});
   const res = await fetch(url, o);
   const requestPath = String(url || "");
   if (res.status === 401 && requestPath.indexOf("/gallery-admin/login") < 0) {
     authUser = null;
+    clearSessionFallbackToken();
     renderAuth();
     loginMsg("Session expired. Please login again.", "info");
   }
@@ -5924,6 +6005,11 @@ async function loginUserPass() {
   try {
     const r = await api("/gallery-admin/login", { method: "POST", body: JSON.stringify({ username: u, password: p }) });
     if (!r.ok) { loginMsg("Login failed: " + await loginErrorText(r), "error"); return; }
+    try {
+      const j = await r.json();
+      const st = String((j || {}).session_token || "").trim();
+      if (st) setSessionFallbackToken(st);
+    } catch (_) {}
     await bootstrap();
     if (!authUser) {
       loginMsg("Login succeeded but session cookie is blocked. Allow cookies for this site.", "error");
@@ -5947,6 +6033,11 @@ async function loginApiKey() {
   try {
     const r = await api("/gallery-admin/login", { method: "POST", body: JSON.stringify({ api_key: k }) });
     if (!r.ok) { loginMsg("API key login failed: " + await loginErrorText(r), "error"); return; }
+    try {
+      const j = await r.json();
+      const st = String((j || {}).session_token || "").trim();
+      if (st) setSessionFallbackToken(st);
+    } catch (_) {}
     await bootstrap();
     if (!authUser) {
       loginMsg("Login succeeded but session cookie is blocked. Allow cookies for this site.", "error");
@@ -5960,7 +6051,7 @@ async function loginApiKey() {
     setLoginBusy(false);
   }
 }
-async function logout() { await api("/gallery-admin/logout", { method: "POST" }); authUser = null; renderAuth(); }
+async function logout() { await api("/gallery-admin/logout", { method: "POST" }); clearSessionFallbackToken(); authUser = null; renderAuth(); }
 
 function renderAuth() {
   const ok = !!authUser;
@@ -6235,10 +6326,21 @@ bootstrap();
 </script>
 </body></html>"""
         html = html.replace("__PRE_LOGIN_NOTICE__", pre_login_notice_json)
+        html = html.replace("__PRE_BOOTSTRAP_TOKEN__", pre_bootstrap_token_json)
         html = html.replace("__PRE_LOGIN_NOTICE_TEXT__", pre_login_notice_text_html)
         html = html.replace("__PRE_LOGIN_NOTICE_CLASS__", pre_login_notice_class)
         from fastapi.responses import HTMLResponse
         r = HTMLResponse(content=html)
+        if pre_bootstrap_token:
+            r.set_cookie(
+                key=_GALLERY_COOKIE,
+                value=pre_bootstrap_token,
+                httponly=True,
+                secure=True,
+                samesite="lax",
+                max_age=int(_GALLERY_TTL_SEC),
+                path="/",
+            )
         r.headers["Cache-Control"] = "no-store"
         r.headers["X-Content-Type-Options"] = "nosniff"
         r.headers["X-Frame-Options"] = "DENY"
