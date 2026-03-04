@@ -37,7 +37,7 @@ import zipfile
 import urllib.request
 import urllib.error
 import secrets
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, List, Dict
@@ -5585,6 +5585,8 @@ def create_app(
 
     @app.post("/gallery-admin/login")
     async def gallery_admin_login(request: Request):
+        from fastapi.responses import JSONResponse, RedirectResponse
+
         payload = await _read_payload_any(request)
         username = ""
         password = ""
@@ -5595,17 +5597,27 @@ def create_app(
             password = str(payload.get("password") or "").strip()
             raw_key = str(payload.get("api_key") or payload.get("apiKey") or "").strip()
             wants_html_redirect = str(payload.get("redirect_html") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+        def _login_fail(status_code: int, detail: str):
+            msg = str(detail or "").strip() or "login failed"
+            if wants_html_redirect:
+                return RedirectResponse(url=f"/gallery-admin?login_error={quote(msg)}", status_code=303)
+            raise HTTPException(status_code=int(status_code or 400), detail=msg)
+
         client_ip = ""
         try:
             client_ip = str((request.client.host if request.client else "") or "")
         except Exception:
             client_ip = ""
         login_subject = username or ("api_key" if raw_key else "anon")
-        _rate_limit_guard(
-            f"gallery_login:{client_ip}:{login_subject}",
-            max_hits=min(12, int(app.state.rate_limit_auth_max)),
-            window_sec=int(app.state.rate_limit_auth_window),
-        )
+        try:
+            _rate_limit_guard(
+                f"gallery_login:{client_ip}:{login_subject}",
+                max_hits=min(12, int(app.state.rate_limit_auth_max)),
+                window_sec=int(app.state.rate_limit_auth_window),
+            )
+        except HTTPException as e:
+            return _login_fail(int(getattr(e, "status_code", 429)), str(getattr(e, "detail", "Too many requests")))
         role = "editor"
         display_name = ""
         user_for_session = ""
@@ -5613,10 +5625,10 @@ def create_app(
             u = _gallery_user_get(username)
             if not u or int(u.get("active") or 0) != 1:
                 log.warning("[gallery-admin] invalid credentials user='%s' ip='%s'", username, client_ip or "-")
-                raise HTTPException(status_code=401, detail="invalid credentials")
+                return _login_fail(401, "invalid credentials")
             if not _gallery_pwd_verify(password, str(u.get("pwd_hash") or ""), str(u.get("pwd_salt") or "")):
                 log.warning("[gallery-admin] invalid credentials user='%s' ip='%s'", username, client_ip or "-")
-                raise HTTPException(status_code=401, detail="invalid credentials")
+                return _login_fail(401, "invalid credentials")
             user_for_session = str(u.get("username") or username).strip().lower()
             display_name = str(u.get("display_name") or "").strip()
             role = str(u.get("role") or "editor").strip().lower()
@@ -5630,16 +5642,18 @@ def create_app(
             finally:
                 con.close()
         elif raw_key:
-            _auth_api_key_recovery(raw_key)  # recovery/admin fallback, independent from auth mode
+            try:
+                _auth_api_key_recovery(raw_key)  # recovery/admin fallback, independent from auth mode
+            except HTTPException as e:
+                return _login_fail(int(getattr(e, "status_code", 401)), str(getattr(e, "detail", "Invalid or missing X-Api-Key")))
             user_for_session = "api_key"
             display_name = "API Key"
             role = "admin"
         else:
-            raise HTTPException(status_code=400, detail="username/password or api_key required")
+            return _login_fail(400, "username/password or api_key required")
         token, exp = _gallery_session_issue(user_for_session, role=role, display_name=display_name)
-        from fastapi.responses import JSONResponse, RedirectResponse
         if wants_html_redirect:
-            r = RedirectResponse(url="/gallery-admin", status_code=303)
+            r = RedirectResponse(url="/gallery-admin?login_result=ok", status_code=303)
         else:
             r = JSONResponse({
                 "ok": True,
@@ -5684,7 +5698,20 @@ def create_app(
             },
         }
     @app.get("/gallery-admin")
-    def gallery_admin_page():
+    def gallery_admin_page(request: Request):
+        login_error = str(request.query_params.get("login_error") or "").strip()
+        login_result = str(request.query_params.get("login_result") or "").strip().lower()
+        pre_login_notice = {"text": "", "kind": "info"}
+        if login_error:
+            pre_login_notice = {"text": f"Login failed: {login_error}", "kind": "error"}
+        elif login_result == "ok":
+            # Form-submit fallback can succeed server-side but still fail on clients that block cookies.
+            if not _gallery_session_check(request):
+                pre_login_notice = {
+                    "text": "Login was accepted, but no session cookie was stored. Enable cookies for this site, then retry.",
+                    "kind": "error",
+                }
+        pre_login_notice_json = _json_dumps(pre_login_notice)
         html = """<!doctype html>
 <html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Company Media Admin</title>
@@ -5758,6 +5785,7 @@ button{cursor:pointer;border:0;background:var(--dark);color:#fff}button.ok{backg
 <div><div class="card"><div class="title">Branding</div><input id="bName" placeholder="Company name" /><div style="margin-top:6px"><input id="bTag" placeholder="Tagline" /></div><div style="margin-top:6px"><input id="bLogo" placeholder="Logo URL (https://...)" /></div><div style="margin-top:6px"><textarea id="bAbout" placeholder="About text"></textarea></div><div class="row"><button class="ok" id="saveBrandBtn" onclick="saveBrand()">Save Branding</button></div></div><div id="usersCard" class="card" style="margin-top:10px;"><div class="title">Team Access</div><div class="row"><input id="uUser" placeholder="username" style="flex:1" /><select id="uRole"><option value="editor">editor</option><option value="admin">admin</option></select></div><div style="margin-top:6px"><input id="uName" placeholder="display name" /></div><div style="margin-top:6px"><input id="uPass" type="password" placeholder="password (new or change)" /></div><div class="row" style="margin-top:6px"><label><input id="uActive" type="checkbox" checked /> active</label><button class="ok" onclick="saveUser()">Save User</button></div><div class="sep"></div><div id="usersList" class="muted"></div></div><div class="card" style="margin-top:10px;"><div class="title">Top 10 Stats</div><div class="row"><button class="alt" onclick="loadTop('selected')">Top Selected</button><button class="alt" onclick="loadTop('downloaded')">Top Downloaded</button></div><div id="topList" class="muted" style="margin-top:8px"></div></div></div></div></div></div>
 <script>
 let categories = [], items = [], currentCategory = "all", selectedFiles = [], checked = new Set(), authUser = null, uploadInProgress = false, loginBusy = false;
+const PRE_LOGIN_NOTICE = __PRE_LOGIN_NOTICE__;
 const pageState = { page: 1, totalPages: 1, total: 0 };
 const esc = (s) => String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]));
 const msg = (t, ok = false) => { const m = document.getElementById("msg"); m.textContent = t || ""; m.style.color = ok ? "#065f46" : "#b91c1c"; };
@@ -5773,6 +5801,9 @@ const loginMsg = (t, kind = "error") => {
   m.textContent = text;
   m.className = "login-status " + (kind === "ok" ? "ok" : (kind === "info" ? "info" : "error"));
 };
+if (PRE_LOGIN_NOTICE && PRE_LOGIN_NOTICE.text) {
+  loginMsg(String(PRE_LOGIN_NOTICE.text || ""), String(PRE_LOGIN_NOTICE.kind || "info"));
+}
 window.addEventListener("error", (e) => {
   const txt = String((e && e.message) || "").trim() || "Unexpected page error.";
   loginMsg("Client error: " + txt, "error");
@@ -6139,6 +6170,7 @@ if (!loginBound2 || !loginBound3) {
 bootstrap();
 </script>
 </body></html>"""
+        html = html.replace("__PRE_LOGIN_NOTICE__", pre_login_notice_json)
         from fastapi.responses import HTMLResponse
         r = HTMLResponse(content=html)
         r.headers["Cache-Control"] = "no-store"
