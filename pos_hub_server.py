@@ -5589,10 +5589,12 @@ def create_app(
         username = ""
         password = ""
         raw_key = ""
+        wants_html_redirect = False
         if isinstance(payload, dict):
             username = str(payload.get("username") or "").strip().lower()
             password = str(payload.get("password") or "").strip()
             raw_key = str(payload.get("api_key") or payload.get("apiKey") or "").strip()
+            wants_html_redirect = str(payload.get("redirect_html") or "").strip().lower() in {"1", "true", "yes", "on"}
         client_ip = ""
         try:
             client_ip = str((request.client.host if request.client else "") or "")
@@ -5635,12 +5637,15 @@ def create_app(
         else:
             raise HTTPException(status_code=400, detail="username/password or api_key required")
         token, exp = _gallery_session_issue(user_for_session, role=role, display_name=display_name)
-        from fastapi.responses import JSONResponse
-        r = JSONResponse({
-            "ok": True,
-            "expires_at": int(exp),
-            "user": {"username": user_for_session, "display_name": display_name, "role": role},
-        })
+        from fastapi.responses import JSONResponse, RedirectResponse
+        if wants_html_redirect:
+            r = RedirectResponse(url="/gallery-admin", status_code=303)
+        else:
+            r = JSONResponse({
+                "ok": True,
+                "expires_at": int(exp),
+                "user": {"username": user_for_session, "display_name": display_name, "role": role},
+            })
         r.set_cookie(
             key=_GALLERY_COOKIE,
             value=token,
@@ -5722,21 +5727,27 @@ button{cursor:pointer;border:0;background:var(--dark);color:#fff}button.ok{backg
   </div>
   <div class="login-grid">
     <div class="login-col">
-      <label class="muted" for="loginUser">Username</label>
-      <input id="loginUser" placeholder="Username" autocomplete="username" spellcheck="false" autocapitalize="none" style="width:100%" />
-      <label class="muted" for="loginPass" style="margin-top:8px">Password</label>
-      <div class="input-wrap">
-        <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password" style="flex:1;border:0;outline:0;padding:0;background:transparent" />
-        <button id="togglePassBtn" type="button" class="ghost-btn">Show</button>
-      </div>
-      <button id="loginBtn" type="button" class="ok cta">Sign In</button>
+      <form id="loginForm" action="/gallery-admin/login" method="post" autocomplete="on">
+        <input type="hidden" name="redirect_html" value="1" />
+        <label class="muted" for="loginUser">Username</label>
+        <input id="loginUser" name="username" placeholder="Username" autocomplete="username" spellcheck="false" autocapitalize="none" style="width:100%" />
+        <label class="muted" for="loginPass" style="margin-top:8px">Password</label>
+        <div class="input-wrap">
+          <input id="loginPass" name="password" type="password" placeholder="Password" autocomplete="current-password" style="flex:1;border:0;outline:0;padding:0;background:transparent" />
+          <button id="togglePassBtn" type="button" class="ghost-btn">Show</button>
+        </div>
+        <button id="loginBtn" type="submit" class="ok cta">Sign In</button>
+      </form>
     </div>
     <div class="login-col">
-      <div class="muted">Recovery</div>
-      <div class="muted" style="margin-top:4px">If password access fails, sign in with your API key and rotate credentials.</div>
-      <label class="muted" for="loginApiKey" style="margin-top:8px">API key</label>
-      <input id="loginApiKey" type="password" placeholder="API Key (recovery)" autocomplete="off" spellcheck="false" style="width:100%" />
-      <button id="apiLoginBtn" type="button" class="alt cta">Login with API Key</button>
+      <form id="apiLoginForm" action="/gallery-admin/login" method="post" autocomplete="off">
+        <input type="hidden" name="redirect_html" value="1" />
+        <div class="muted">Recovery</div>
+        <div class="muted" style="margin-top:4px">If password access fails, sign in with your API key and rotate credentials.</div>
+        <label class="muted" for="loginApiKey" style="margin-top:8px">API key</label>
+        <input id="loginApiKey" name="api_key" type="password" placeholder="API Key (recovery)" autocomplete="off" spellcheck="false" style="width:100%" />
+        <button id="apiLoginBtn" type="submit" class="alt cta">Login with API Key</button>
+      </form>
     </div>
   </div>
   <div id="loginMsg" class="login-status hidden" role="status" aria-live="polite"></div>
@@ -5762,6 +5773,13 @@ const loginMsg = (t, kind = "error") => {
   m.textContent = text;
   m.className = "login-status " + (kind === "ok" ? "ok" : (kind === "info" ? "info" : "error"));
 };
+window.addEventListener("error", (e) => {
+  const txt = String((e && e.message) || "").trim() || "Unexpected page error.";
+  loginMsg("Client error: " + txt, "error");
+});
+window.addEventListener("unhandledrejection", () => {
+  loginMsg("Client error: unhandled async failure.", "error");
+});
 const hsize = (n) => { n = Number(n || 0); if (n < 1024) return n + " B"; if (n < 1048576) return (n / 1024).toFixed(1) + " KB"; return (n / 1048576).toFixed(1) + " MB"; };
 
 async function api(url, opt = {}) {
@@ -5780,7 +5798,7 @@ async function api(url, opt = {}) {
 
 function setLoginBusy(on) {
   loginBusy = !!on;
-  ["loginUser", "loginPass", "loginApiKey", "loginBtn", "apiLoginBtn", "togglePassBtn"].forEach((id) => {
+  ["loginUser", "loginPass", "loginApiKey", "loginBtn", "apiLoginBtn", "togglePassBtn", "loginForm", "apiLoginForm"].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.disabled = loginBusy;
   });
@@ -6061,6 +6079,7 @@ async function uploadSelected() {
 
 function setupDrop() {
   const dz = document.getElementById("dropZone");
+  if (!dz) return;
   dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.style.background = "#ecfeff"; });
   dz.addEventListener("dragleave", () => { dz.style.background = "#f8fbff"; });
   dz.addEventListener("drop", (e) => {
@@ -6097,22 +6116,26 @@ async function bootstrap() {
   msg("Ready.", true);
 }
 
-document.getElementById("filesInput").addEventListener("change", (e) => pickFilesFromInput(e.target));
-document.getElementById("folderInput").addEventListener("change", (e) => pickFilesFromInput(e.target));
-document.getElementById("togglePassBtn").addEventListener("click", () => toggleLoginPassword());
-document.getElementById("loginBtn").addEventListener("click", () => loginUserPass());
-document.getElementById("apiLoginBtn").addEventListener("click", () => loginApiKey());
-document.getElementById("loginUser").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loginUserPass(); } });
-document.getElementById("loginPass").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loginUserPass(); } });
-document.getElementById("loginApiKey").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loginApiKey(); } });
-window.addEventListener("error", (e) => {
-  const txt = String((e && e.message) || "").trim() || "Unexpected page error.";
-  loginMsg("Client error: " + txt, "error");
-});
-window.addEventListener("unhandledrejection", () => {
-  loginMsg("Client error: unhandled async failure.", "error");
-});
+function bindEvent(id, eventName, handler, useOnClickFallback = false) {
+  const el = document.getElementById(id);
+  if (!el) return false;
+  try { el.addEventListener(eventName, handler); } catch (_) { return false; }
+  if (useOnClickFallback && eventName === "click") {
+    try { el.onclick = handler; } catch (_) {}
+  }
+  return true;
+}
+
+const loginBound1 = bindEvent("togglePassBtn", "click", () => toggleLoginPassword(), true);
+const loginBound2 = bindEvent("loginForm", "submit", (e) => { e.preventDefault(); loginUserPass(); });
+const loginBound3 = bindEvent("apiLoginForm", "submit", (e) => { e.preventDefault(); loginApiKey(); });
+
+bindEvent("filesInput", "change", (e) => pickFilesFromInput(e.target));
+bindEvent("folderInput", "change", (e) => pickFilesFromInput(e.target));
 setupDrop();
+if (!loginBound2 || !loginBound3) {
+  loginMsg("Login UI failed to initialize. Please refresh once (Ctrl+F5).", "error");
+}
 bootstrap();
 </script>
 </body></html>"""
