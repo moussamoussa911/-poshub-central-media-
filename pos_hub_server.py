@@ -1117,8 +1117,19 @@ def _ensure_unique_article_number(con: sqlite3.Connection, proposed: Optional[st
     if not s:
         return _menu_next_article_number(con)
 
-    exists = con.execute("SELECT 1 FROM menu_items WHERE article_number=? LIMIT 1", (s,)).fetchone()
+    exists = con.execute(
+        "SELECT id, COALESCE(is_active,1) AS is_active FROM menu_items WHERE article_number=? LIMIT 1",
+        (s,),
+    ).fetchone()
     if exists:
+        ex = dict(exists)
+        if int(ex.get("is_active") or 0) == 0:
+            # Recycle archived article numbers so active items can reuse them.
+            con.execute(
+                "UPDATE menu_items SET article_number=NULL, updated_at=? WHERE id=?",
+                (_now(), int(ex.get("id") or 0)),
+            )
+            return s
         if s.isdigit():
             return _menu_next_article_number(con, start_from=int(s) + 1)
         return _menu_next_article_number(con)
@@ -3203,9 +3214,19 @@ def create_app(
 
             # Unique barcode (if provided)
             if barcode is not None:
-                exists_bc = con.execute("SELECT 1 FROM menu_items WHERE barcode=? LIMIT 1", (barcode,)).fetchone()
+                exists_bc = con.execute(
+                    "SELECT id, COALESCE(is_active,1) AS is_active FROM menu_items WHERE barcode=? LIMIT 1",
+                    (barcode,),
+                ).fetchone()
                 if exists_bc:
-                    raise HTTPException(status_code=409, detail="barcode already exists")
+                    ex_bc = dict(exists_bc)
+                    if int(ex_bc.get("is_active") or 0) == 0:
+                        con.execute(
+                            "UPDATE menu_items SET barcode=NULL, updated_at=? WHERE id=?",
+                            (ts, int(ex_bc.get("id") or 0)),
+                        )
+                    else:
+                        raise HTTPException(status_code=409, detail="barcode already exists")
 
             article_number = _ensure_unique_article_number(con, body.article_number)
 
@@ -3975,20 +3996,36 @@ def create_app(
             # Unique article_number
             if body.article_number is not None and body.article_number != prev_article_number:
                 exists = con.execute(
-                    "SELECT id FROM menu_items WHERE article_number=? AND id<>? LIMIT 1",
+                    "SELECT id, COALESCE(is_active,1) AS is_active FROM menu_items "
+                    "WHERE article_number=? AND id<>? LIMIT 1",
                     (body.article_number, int(item_id)),
                 ).fetchone()
                 if exists:
-                    raise HTTPException(status_code=409, detail="article_number already exists")
+                    ex = dict(exists)
+                    if int(ex.get("is_active") or 0) == 0:
+                        con.execute(
+                            "UPDATE menu_items SET article_number=NULL, updated_at=? WHERE id=?",
+                            (ts, int(ex.get("id") or 0)),
+                        )
+                    else:
+                        raise HTTPException(status_code=409, detail="article_number already exists")
 
             # Unique barcode (if provided)
             if barcode is not None and barcode != prev_barcode:
                 exists_bc = con.execute(
-                    "SELECT id FROM menu_items WHERE barcode=? AND id<>? LIMIT 1",
+                    "SELECT id, COALESCE(is_active,1) AS is_active FROM menu_items "
+                    "WHERE barcode=? AND id<>? LIMIT 1",
                     (barcode, int(item_id)),
                 ).fetchone()
                 if exists_bc:
-                    raise HTTPException(status_code=409, detail="barcode already exists")
+                    ex_bc = dict(exists_bc)
+                    if int(ex_bc.get("is_active") or 0) == 0:
+                        con.execute(
+                            "UPDATE menu_items SET barcode=NULL, updated_at=? WHERE id=?",
+                            (ts, int(ex_bc.get("id") or 0)),
+                        )
+                    else:
+                        raise HTTPException(status_code=409, detail="barcode already exists")
 
             cur = con.cursor()
             cur.execute(
