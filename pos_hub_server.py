@@ -3921,8 +3921,15 @@ def create_app(
         _gallery_user_delete(username)
         return {"ok": True}
 
+    @api.put("/menu/{item_id}/{legacy}")
     @api.put("/menu/{item_id}")
-    async def api_menu_update(item_id: int, request: Request, x_api_key: Optional[str] = Header(default=None)) -> dict:
+    async def api_menu_update(
+        item_id: int,
+        request: Request,
+        legacy: Optional[str] = None,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        _ = legacy  # keep compatibility with older clients that append a trailing segment (e.g. /menu/{id}/NA)
         _auth(x_api_key)
         payload = await _read_payload_any(request)
         if not payload:
@@ -3947,7 +3954,8 @@ def create_app(
             incl_sauce = _resolve_incl_sauce(con, body.main_category, body.incl_sauce)
             incl_sauce_db = None if incl_sauce is None else _json_dumps(incl_sauce)
             prev = con.execute(
-                "SELECT image_url, image_url_local, image_url_online, tenant_id, location_id FROM menu_items WHERE id=? LIMIT 1",
+                "SELECT image_url, image_url_local, image_url_online, tenant_id, location_id, article_number, barcode "
+                "FROM menu_items WHERE id=? LIMIT 1",
                 (int(item_id),),
             ).fetchone()
             if not prev:
@@ -3961,9 +3969,11 @@ def create_app(
             tenant_id_eff = (body.tenant_id if body.tenant_id is not None else prev_d.get("tenant_id") or "").strip()
             location_id_eff = (body.location_id if body.location_id is not None else prev_d.get("location_id") or "").strip()
             _enforce_tenant_access(tenant_id_eff, location_id_eff)
+            prev_article_number = _normalize_article_number(prev_d.get("article_number"))
+            prev_barcode = _normalize_barcode(prev_d.get("barcode"))
 
             # Unique article_number
-            if body.article_number is not None:
+            if body.article_number is not None and body.article_number != prev_article_number:
                 exists = con.execute(
                     "SELECT id FROM menu_items WHERE article_number=? AND id<>? LIMIT 1",
                     (body.article_number, int(item_id)),
@@ -3972,7 +3982,7 @@ def create_app(
                     raise HTTPException(status_code=409, detail="article_number already exists")
 
             # Unique barcode (if provided)
-            if barcode is not None:
+            if barcode is not None and barcode != prev_barcode:
                 exists_bc = con.execute(
                     "SELECT id FROM menu_items WHERE barcode=? AND id<>? LIMIT 1",
                     (barcode, int(item_id)),
@@ -4065,8 +4075,10 @@ def create_app(
 
         return {"ok": True, "seq": seq}
 
+    @api.delete("/menu/{item_id}/{legacy}")
     @api.delete("/menu/{item_id}")
-    def api_menu_delete(item_id: int, x_api_key: Optional[str] = Header(default=None)) -> dict:
+    def api_menu_delete(item_id: int, legacy: Optional[str] = None, x_api_key: Optional[str] = Header(default=None)) -> dict:
+        _ = legacy  # legacy suffix compatibility
         _auth(x_api_key)
         con = _connect(db_path)
         ts = _now()
@@ -6578,6 +6590,37 @@ bootstrap();
         _auth(x_api_key)
         _enforce_tenant_access(tenant_id, location_id)
         return _menu_list_impl(request, since, main_category, sub_category, active_only, tenant_id, location_id)
+
+    @app.post("/menu")
+    async def menu_create_root(request: Request, x_api_key: Optional[str] = Header(default=None)) -> dict:
+        # Root-level backward compatibility for old clients that do not use /api prefix.
+        return await api_menu_create(request=request, x_api_key=x_api_key)
+
+    @app.post("/menu/upload_image")
+    async def menu_upload_image_root(
+        request: Request,
+        file: UploadFile = File(...),
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        # Root-level backward compatibility for old clients that do not use /api prefix.
+        return await api_menu_upload_image(request=request, file=file, x_api_key=x_api_key)
+
+    @app.put("/menu/{item_id}/{legacy}")
+    @app.put("/menu/{item_id}")
+    async def menu_update_root(
+        item_id: int,
+        request: Request,
+        legacy: Optional[str] = None,
+        x_api_key: Optional[str] = Header(default=None),
+    ) -> dict:
+        # Root-level backward compatibility (+ optional legacy suffix).
+        return await api_menu_update(item_id=item_id, request=request, legacy=legacy, x_api_key=x_api_key)
+
+    @app.delete("/menu/{item_id}/{legacy}")
+    @app.delete("/menu/{item_id}")
+    def menu_delete_root(item_id: int, legacy: Optional[str] = None, x_api_key: Optional[str] = Header(default=None)) -> dict:
+        # Root-level backward compatibility (+ optional legacy suffix).
+        return api_menu_delete(item_id=item_id, legacy=legacy, x_api_key=x_api_key)
 
     # ---- Zutaten / Ingredients helper ----
     @app.get("/ingredients")
