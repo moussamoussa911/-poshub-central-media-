@@ -1243,7 +1243,20 @@ class UpdateDeliveryOrder(BaseModel):
     status: Optional[str] = None
     driver: Optional[str] = None
     finished_at: Optional[str] = None
+    completed_at: Optional[str] = None
     gesamtepreis: Optional[float] = None
+    tish: Optional[str] = None
+    ordernumber: Optional[str] = None
+    telefonnummber: Optional[str] = None
+    adresse: Optional[str] = None
+    hausnummer: Optional[str] = None
+    PLZ: Optional[str] = None
+    stadt: Optional[str] = None
+    name: Optional[str] = None
+    distance: Optional[str] = None
+    side: Optional[str] = None
+    delivery_time: Optional[str] = None
+    comment: Optional[str] = None
     updated_at: Optional[str] = None
 
 
@@ -6803,6 +6816,8 @@ bootstrap();
     @app.get("/orders/delivery")
     def list_delivery_orders(
         status: Optional[str] = None,
+        tish: Optional[str] = None,
+        only_active: bool = False,
         tenant_id: Optional[str] = None,
         location_id: Optional[str] = None,
         include_items: bool = False,
@@ -6846,9 +6861,20 @@ bootstrap();
         try:
             where = []
             params: list[Any] = []
+            where.append(
+                "COALESCE(TRIM(tish),'') <> '' AND ("
+                "UPPER(COALESCE(tish,'')) LIKE 'DEL%' OR "
+                "UPPER(COALESCE(side,'')) IN ('DELIVERY','LIEFERUNG','ONLINE','LIEFERANDO','WOLT','UBEREATS')"
+                ")"
+            )
             if status:
                 where.append("status=?")
                 params.append(status)
+            if tish is not None and str(tish).strip() != "":
+                where.append("UPPER(tish)=UPPER(?)")
+                params.append(str(tish).strip())
+            if only_active:
+                where.append("UPPER(COALESCE(status,'')) NOT IN ('COMPLETED','CANCELED')")
             if tenant_id is not None and str(tenant_id).strip() != "":
                 where.append("tenant_id=?")
                 params.append(str(tenant_id).strip())
@@ -6865,6 +6891,7 @@ bootstrap();
             for r in rows:
                 o = dict(r)
                 o["ID"] = int(o["ID"])
+                o["is_open"] = str(o.get("status") or "").strip().upper() not in ("COMPLETED", "CANCELED")
                 try:
                     o["gesamtepreis_eur"] = (int(o.get("gesamtepreis") or 0) / 100.0)
                 except Exception:
@@ -6912,6 +6939,17 @@ bootstrap();
 
         if body.gesamtepreis is not None:
             updates["gesamtepreis"] = int(round(float(body.gesamtepreis) * 100))
+
+        for fld in (
+            "tish", "ordernumber", "telefonnummber", "adresse", "hausnummer", "PLZ", "stadt",
+            "name", "distance", "side", "delivery_time", "comment"
+        ):
+            val = getattr(body, fld, None)
+            if val is not None:
+                updates[fld] = str(val)
+
+        if body.completed_at is not None:
+            updates["completed_at"] = body.completed_at
 
         updates["updated_at"] = body.updated_at or _now()
 
