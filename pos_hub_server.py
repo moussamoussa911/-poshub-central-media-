@@ -5891,223 +5891,543 @@ def create_app(
 <html><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Company Media Admin</title>
 <style>
+/* === V2 DIPTYCH — MindMeshLab redesign — Vanilla CSS adaptation === */
 :root{
-  --bg:#f8fafc; --bg-soft:#f1f5f9; --card:#ffffff; --line:#e2e8f0; --line-strong:#cbd5e1;
-  --txt:#0f172a; --txt-soft:#334155; --muted:#64748b; --muted-light:#94a3b8;
-  --brand:#0d9488; --brand-dark:#0f766e; --brand-light:#14b8a6; --brand-bg:#f0fdfa;
-  --dark:#0f172a; --darker:#020617; --danger:#dc2626; --danger-light:#fef2f2;
-  --ok:#16a34a; --ok-light:#f0fdf4; --warn:#d97706; --info:#2563eb;
-  --shadow-sm:0 1px 2px rgba(15,23,42,.05);
-  --shadow:0 1px 3px rgba(15,23,42,.08), 0 1px 2px rgba(15,23,42,.04);
-  --shadow-md:0 4px 12px rgba(15,23,42,.06), 0 2px 4px rgba(15,23,42,.04);
-  --shadow-lg:0 10px 24px rgba(15,23,42,.08), 0 4px 8px rgba(15,23,42,.04);
-  --radius:10px; --radius-lg:14px; --radius-xl:18px;
+  --bg:#f0eee9;        /* warm cream */
+  --bg-soft:#fafaf8;
+  --card:#ffffff;
+  --line:rgba(0,0,0,.08);
+  --line-strong:rgba(0,0,0,.18);
+  --txt:#0a0a0a;
+  --txt-soft:#1f1f1f;
+  --muted:rgba(10,10,10,.5);
+  --muted-light:rgba(10,10,10,.35);
+  --hero-bg:#0a0a0a;
+  --hero-fg:#f4f3ef;
+  --hero-muted:rgba(255,255,255,.5);
+  --hero-faint:rgba(255,255,255,.12);
+  --accent:#0a0a0a;
+  --ok:#4ade80;
+  --danger:#dc2626;
+  --shadow-sm:0 1px 2px rgba(15,23,42,.04);
+  --shadow:0 2px 8px rgba(15,23,42,.05);
+  --shadow-md:0 8px 24px rgba(15,23,42,.07);
+  --shadow-lg:0 18px 50px rgba(15,23,42,.10);
+  --radius:0px;        /* Diptych = sharp lines, no roundings */
+  --radius-lg:0px;
+  --serif:'Cormorant Garamond', 'Garamond', Georgia, 'Times New Roman', serif;
+  --mono:'JetBrains Mono', 'SF Mono', Consolas, 'Courier New', monospace;
+  --sans:'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
 }
 *{box-sizing:border-box}
 html{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
-body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--txt);font-size:14px;line-height:1.5}
+body{margin:0;font-family:var(--sans);background:var(--bg);color:var(--txt);font-size:13px;line-height:1.5}
 
-.wrap{max-width:1600px;margin:0 auto;padding:20px 24px}
-
-.hero{
-  display:flex;gap:18px;align-items:center;padding:22px 26px;
-  border-radius:var(--radius-xl);
-  background:linear-gradient(130deg,#0f172a 0%,#134e4a 50%,#0d9488 100%);
-  color:#fff;box-shadow:var(--shadow-lg);position:relative;overflow:hidden;
+/* ============ DIPTYCH LOGIN (split-screen) ============ */
+.diptych{
+  position:fixed;inset:0;display:grid;grid-template-columns:1fr 1fr;
+  background:var(--bg);
 }
-.hero::before{content:"";position:absolute;top:-40%;right:-10%;width:300px;height:300px;background:radial-gradient(circle,rgba(20,184,166,.3),transparent 70%);pointer-events:none}
-.logo{width:64px;height:64px;border-radius:14px;object-fit:cover;background:rgba(255,255,255,.15);box-shadow:0 4px 12px rgba(0,0,0,.2);position:relative;z-index:1}
-.hero h1{margin:0;font-size:24px;font-weight:700;letter-spacing:-0.01em;position:relative;z-index:1}
-.hero p{margin:4px 0 0 0;opacity:.85;font-size:13.5px;font-weight:400;position:relative;z-index:1}
-
-.grid{display:grid;grid-template-columns:300px 1fr 340px;gap:18px;margin-top:18px}
-
-.card{
-  background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);
-  padding:18px;box-shadow:var(--shadow);transition:box-shadow .2s ease;
+.dx-hero{
+  background:var(--hero-bg);color:var(--hero-fg);position:relative;overflow:hidden;
+  padding:56px;display:flex;flex-direction:column;justify-content:space-between;
 }
-.card:hover{box-shadow:var(--shadow-md)}
-
-.title{
-  font-weight:700;font-size:15px;margin-bottom:14px;color:var(--txt);
-  letter-spacing:-0.01em;display:flex;align-items:center;gap:8px;
+.dx-hero-corner{display:flex;align-items:center;gap:14px;position:relative;z-index:2}
+.dx-hero-corner img{width:36px;height:36px;object-fit:cover;background:rgba(255,255,255,.06)}
+.dx-hero-corner .wordmark{font-size:10px;letter-spacing:.45em;text-transform:uppercase;color:var(--hero-fg);font-weight:500}
+.dx-hero-watermark{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  opacity:.07;font-family:var(--serif);font-size:380px;font-weight:300;letter-spacing:-0.02em;
+  pointer-events:none;color:var(--hero-fg);user-select:none;
 }
-.title::before{content:"";width:3px;height:14px;background:var(--brand);border-radius:2px}
+.dx-hero-pitch{position:relative;z-index:2;max-width:440px}
+.dx-hero-pitch .eyebrow{font-size:10px;letter-spacing:.42em;color:var(--hero-muted);text-transform:uppercase;margin-bottom:18px}
+.dx-hero-pitch h2{
+  font-family:var(--serif);font-weight:300;font-size:46px;line-height:1.08;
+  letter-spacing:-0.01em;margin:0 0 16px 0;color:var(--hero-fg);
+}
+.dx-hero-pitch .lead{font-size:13.5px;color:var(--hero-muted);max-width:380px;line-height:1.6;margin:0}
+.dx-hero-meta{display:flex;justify-content:space-between;font-size:10px;letter-spacing:.22em;color:rgba(255,255,255,.4);text-transform:uppercase;position:relative;z-index:2}
+.dx-hero-meta .dot{display:inline-flex;align-items:center;gap:8px}
+.dx-hero-meta .dot::before{content:"";width:6px;height:6px;border-radius:6px;background:var(--ok)}
+
+.dx-form{
+  background:#fff;color:var(--txt);position:relative;
+  padding:56px;display:flex;flex-direction:column;justify-content:space-between;
+}
+.dx-form-top{display:flex;justify-content:flex-end;font-size:10px;letter-spacing:.3em;color:var(--muted);text-transform:uppercase}
+.dx-form-body{max-width:380px;margin:0 auto;width:100%;padding:32px 0}
+.dx-form-body .step{font-size:10px;letter-spacing:.42em;color:var(--muted);margin-bottom:14px;text-transform:uppercase}
+.dx-form-body h1{font-family:var(--sans);font-weight:300;font-size:34px;margin:0 0 36px 0;letter-spacing:-0.015em;line-height:1.15}
+.dx-field{margin-bottom:22px}
+.dx-field label{display:block;font-size:10px;letter-spacing:.3em;color:var(--muted);text-transform:uppercase;margin-bottom:8px;font-weight:500}
+.dx-field input[type="text"],.dx-field input[type="password"],.dx-field input:not([type]){
+  width:100%;border:0;border-bottom:1px solid var(--line-strong);
+  background:transparent;padding:8px 0;font-size:14px;color:var(--txt);
+  font-family:var(--sans);outline:none;transition:border-color .15s ease;
+}
+.dx-field input:focus{border-bottom-color:var(--accent)}
+.dx-field .input-wrap{
+  display:flex;align-items:center;gap:8px;border:0;border-bottom:1px solid var(--line-strong);
+  padding:0;background:transparent;border-radius:0;
+}
+.dx-field .input-wrap input{border:0 !important;background:transparent;padding:8px 0;width:100%;outline:none}
+.dx-field .input-wrap:focus-within{border-bottom-color:var(--accent);box-shadow:none}
+.ghost-btn{
+  background:transparent;color:var(--muted);border:0;padding:4px 8px;border-radius:0;
+  font-size:10px;letter-spacing:.2em;text-transform:uppercase;font-weight:500;cursor:pointer;
+  font-family:var(--sans);
+}
+.ghost-btn:hover{color:var(--txt)}
+.dx-cta{
+  width:100%;margin-top:18px;padding:14px 16px;
+  background:var(--txt);color:var(--bg);border:0;cursor:pointer;
+  font-family:var(--sans);font-size:11px;letter-spacing:.32em;text-transform:uppercase;font-weight:500;
+  display:flex;justify-content:space-between;align-items:center;border-radius:0;
+  transition:background .15s ease;
+}
+.dx-cta:hover{background:#1a1a1a}
+.dx-cta.alt{background:transparent;color:var(--txt);border:1px solid var(--line-strong)}
+.dx-cta.alt:hover{background:var(--txt);color:var(--bg)}
+.dx-recovery{
+  margin-top:32px;padding:20px;border:1px solid var(--line);
+}
+.dx-recovery .recovery-label{font-size:9px;letter-spacing:.3em;color:var(--muted);text-transform:uppercase;margin-bottom:10px}
+.dx-recovery input{font-family:var(--mono);font-size:12px}
+.dx-form-bottom{font-size:10px;letter-spacing:.22em;color:var(--muted);text-transform:uppercase}
+
+.login-status{margin-top:14px;padding:12px 14px;font-size:12px;font-weight:500;line-height:1.45;border-radius:0;border-left:3px solid;letter-spacing:.02em}
+.login-status.error{background:#fdf2f2;border-color:var(--danger);color:#7a1818}
+.login-status.ok{background:#f0fdf4;border-color:var(--ok);color:#15532f}
+.login-status.info{background:#f1f5f9;border-color:#475569;color:#334155}
+
+/* hide whole login when authed */
+.diptych.hidden,#loginCard.hidden{display:none !important}
+
+/* ============ DASHBOARD (sidebar + main) ============ */
+.app-shell{
+  position:fixed;inset:0;display:flex;background:var(--bg-soft);color:var(--txt);
+  font-family:var(--sans);
+}
+.app-sidebar{
+  width:240px;background:#fff;border-right:1px solid var(--line);
+  padding:28px 0;display:flex;flex-direction:column;flex-shrink:0;
+}
+.app-brand{padding:0 24px 28px;display:flex;align-items:center;gap:12px}
+.app-brand img{width:30px;height:30px;object-fit:cover;background:#f1f5f9}
+.app-brand .wm{font-size:9px;letter-spacing:.42em;color:var(--txt);text-transform:uppercase;font-weight:600}
+.app-brand .wm small{display:block;font-size:8px;letter-spacing:.25em;color:var(--muted);font-weight:400;margin-top:2px}
+.nav-section{padding:0 24px 12px;font-size:9px;letter-spacing:.3em;color:var(--muted);text-transform:uppercase;margin-top:6px}
+.nav-item{
+  padding:11px 24px;display:flex;align-items:center;gap:12px;
+  font-size:12.5px;color:var(--muted);cursor:pointer;
+  border-left:2px solid transparent;margin-left:-1px;letter-spacing:.04em;
+  transition:all .12s ease;background:transparent;border-radius:0;
+  width:100%;text-align:left;font-family:var(--sans);font-weight:400;
+}
+.nav-item:hover{color:var(--txt);background:rgba(0,0,0,.02)}
+.nav-item.active{color:var(--txt);background:rgba(0,0,0,.04);border-left-color:var(--txt);font-weight:500}
+.nav-item .nav-icon{width:14px;height:14px;display:inline-flex;align-items:center;justify-content:center;font-size:13px;opacity:.85}
+.nav-spacer{flex:1}
+.nav-user{
+  padding:14px 24px;border-top:1px solid var(--line);
+  display:flex;align-items:center;gap:10px;
+}
+.nav-user .avatar{
+  width:30px;height:30px;border-radius:50%;background:#e8e6e0;color:var(--txt);
+  font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+}
+.nav-user .meta{min-width:0;flex:1}
+.nav-user .name{font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nav-user .role{font-size:9px;letter-spacing:.2em;color:var(--muted);text-transform:uppercase}
+.nav-user .logout{
+  background:transparent;color:var(--muted);border:0;padding:4px 6px;
+  font-size:14px;cursor:pointer;border-radius:0;flex-shrink:0;
+}
+.nav-user .logout:hover{color:var(--danger)}
+
+.app-main{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.app-topbar{
+  padding:18px 32px;border-bottom:1px solid var(--line);background:#fff;
+  display:flex;align-items:center;gap:16px;flex-shrink:0;
+}
+.search-box{
+  flex:1;max-width:420px;display:flex;align-items:center;gap:10px;
+  padding:9px 14px;border:1px solid var(--line);background:#fafaf8;
+  font-size:12.5px;color:var(--muted);
+}
+.search-box input{flex:1;border:0;background:transparent;outline:none;font-size:12.5px;color:var(--txt);font-family:inherit}
+.search-box .kbd{font-family:var(--mono);font-size:10px;color:var(--muted)}
+.topbar-spacer{flex:1}
+.topbar-actions{display:flex;gap:10px;align-items:center}
+
+.btn{
+  cursor:pointer;border:1px solid var(--line-strong);background:#fff;color:var(--txt);
+  border-radius:0;padding:9px 16px;font-size:11px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;
+  font-family:var(--sans);transition:all .15s ease;display:inline-flex;align-items:center;gap:8px;
+}
+.btn:hover:not(:disabled){background:var(--txt);color:var(--bg);border-color:var(--txt)}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.btn.primary{background:var(--txt);color:var(--bg);border-color:var(--txt)}
+.btn.primary:hover:not(:disabled){background:#1a1a1a}
+.btn.danger{background:#fff;color:var(--danger);border-color:#fecaca}
+.btn.danger:hover:not(:disabled){background:var(--danger);color:#fff;border-color:var(--danger)}
+.btn.small{padding:6px 12px;font-size:10px;letter-spacing:.15em}
+
+.app-content{flex:1;padding:28px 32px;overflow-y:auto}
+.page-header{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px;gap:20px;flex-wrap:wrap}
+.page-header .meta{font-size:10px;letter-spacing:.35em;color:var(--muted);text-transform:uppercase;margin-bottom:10px}
+.page-header h1{font-family:var(--serif);font-weight:400;font-size:36px;margin:0;letter-spacing:-0.01em;line-height:1.1}
+.page-header .stats{font-size:10px;color:var(--muted);letter-spacing:.2em;text-transform:uppercase;display:inline-flex;align-items:center;gap:8px;font-weight:500}
+.page-header .stats::before{content:"";width:6px;height:6px;border-radius:6px;background:var(--ok)}
+
+.dx-grid{display:grid;grid-template-columns:300px 1fr 320px;gap:20px;align-items:start}
+.dx-col{display:flex;flex-direction:column;gap:16px;min-width:0}
+
+.panel{
+  background:#fff;border:1px solid var(--line);padding:20px;
+}
+.panel-head{
+  font-size:9px;letter-spacing:.32em;color:var(--muted);text-transform:uppercase;
+  font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:10px;
+}
+.panel-head .count{
+  margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--txt);
+  background:var(--bg);padding:2px 6px;letter-spacing:0;
+}
+.panel h3{
+  font-family:var(--serif);font-weight:400;font-size:22px;margin:0 0 6px 0;letter-spacing:-0.005em;
+}
 
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 
-input,select,textarea{
-  border:1px solid var(--line);border-radius:var(--radius);padding:9px 12px;
-  font-size:14px;background:#fff;color:var(--txt);font-family:inherit;
-  transition:border-color .15s ease, box-shadow .15s ease;outline:none;
+.in{
+  width:100%;border:1px solid var(--line);border-radius:0;padding:9px 11px;
+  font-size:12.5px;background:#fff;color:var(--txt);font-family:inherit;outline:none;
+  transition:border-color .15s ease;
 }
-input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(13,148,136,.12)}
-input::placeholder,textarea::placeholder{color:var(--muted-light)}
-textarea{width:100%;min-height:84px;resize:vertical;line-height:1.5}
+.in:focus{border-color:var(--accent)}
+.in::placeholder{color:var(--muted-light)}
+textarea.in{min-height:80px;resize:vertical;line-height:1.5}
 
-button{
-  cursor:pointer;border:0;background:var(--dark);color:#fff;
-  border-radius:var(--radius);padding:9px 14px;font-size:13.5px;font-weight:600;
-  font-family:inherit;letter-spacing:0;transition:all .15s ease;
-  display:inline-flex;align-items:center;justify-content:center;gap:6px;
-  box-shadow:var(--shadow-sm);
+input,select,textarea{
+  border:1px solid var(--line);border-radius:0;padding:8px 11px;
+  font-size:12.5px;background:#fff;color:var(--txt);font-family:inherit;outline:none;
+  transition:border-color .15s ease;
 }
-button:hover:not(:disabled){transform:translateY(-1px);box-shadow:var(--shadow-md);filter:brightness(1.08)}
-button:active:not(:disabled){transform:translateY(0)}
-button:disabled{opacity:.55;cursor:not-allowed;transform:none}
-button.ok{background:linear-gradient(135deg,var(--brand) 0%,var(--brand-dark) 100%)}
-button.alt{background:#475569}
-button.danger{background:linear-gradient(135deg,var(--danger) 0%,#991b1b 100%)}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+input::placeholder,textarea::placeholder{color:var(--muted-light)}
+button{
+  cursor:pointer;border:1px solid var(--line-strong);background:#fff;color:var(--txt);
+  border-radius:0;padding:8px 14px;font-size:11px;font-weight:500;
+  letter-spacing:.14em;text-transform:uppercase;font-family:var(--sans);
+  transition:all .14s ease;display:inline-flex;align-items:center;justify-content:center;gap:6px;
+}
+button:hover:not(:disabled){background:var(--txt);color:var(--bg);border-color:var(--txt)}
+button:disabled{opacity:.55;cursor:not-allowed}
+button.ok{background:var(--txt);color:var(--bg);border-color:var(--txt)}
+button.ok:hover:not(:disabled){background:#1a1a1a}
+button.alt{background:#fff;color:var(--txt);border-color:var(--line-strong)}
+button.danger{background:#fff;color:var(--danger);border-color:#fecaca}
+button.danger:hover:not(:disabled){background:var(--danger);color:#fff;border-color:var(--danger)}
 
 .cats{
-  max-height:380px;overflow-y:auto;border:1px solid var(--line);
-  border-radius:var(--radius);background:#fafbfc;
+  border:1px solid var(--line);background:#fff;max-height:340px;overflow-y:auto;
 }
-.cats::-webkit-scrollbar{width:6px}
-.cats::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
 .cat{
-  padding:10px 12px;border-bottom:1px solid #eef2f6;cursor:pointer;
-  display:flex;align-items:center;gap:10px;transition:background .12s ease;
-  font-size:13.5px;
+  padding:11px 14px;border-bottom:1px solid var(--line);cursor:pointer;
+  display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--txt);
+  transition:all .12s ease;background:#fff;
 }
 .cat:last-child{border-bottom:0}
-.cat:hover{background:#f1f5f9}
-.cat.active{background:var(--brand-bg);color:var(--brand-dark);font-weight:600;border-left:3px solid var(--brand);padding-left:9px}
+.cat:hover{background:#fafaf8}
+.cat.active{background:var(--txt);color:var(--bg);border-left:3px solid var(--accent);padding-left:11px}
+.cat.active .small{color:rgba(255,255,255,.55)}
 
-.thumb{width:36px;height:36px;border-radius:8px;object-fit:cover;background:#e2e8f0;flex-shrink:0;box-shadow:var(--shadow-sm)}
+.thumb{width:32px;height:32px;object-fit:cover;background:#f1f5f9;flex-shrink:0;border-radius:0}
 
 .drop{
-  border:2px dashed var(--line-strong);border-radius:var(--radius-lg);
-  padding:18px 14px;text-align:center;color:var(--muted);
-  background:linear-gradient(180deg,#fafbfc 0%,#f1f5f9 100%);
-  transition:all .15s ease;cursor:pointer;font-size:13px;
+  border:1px dashed var(--line-strong);padding:18px 14px;text-align:center;
+  color:var(--muted);background:#fafaf8;font-size:11px;letter-spacing:.15em;text-transform:uppercase;
+  transition:all .15s ease;cursor:pointer;
 }
-.drop:hover,.drop.drag-over{border-color:var(--brand);background:var(--brand-bg);color:var(--brand-dark)}
+.drop:hover,.drop.drag-over{border-color:var(--txt);background:#fff;color:var(--txt)}
 
 .toolbar{
-  display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;
+  display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px;
   padding-bottom:14px;border-bottom:1px solid var(--line);
 }
-.toolbar:has(.title){padding-bottom:14px}
 
-.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px}
+.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px}
 
 .tile{
-  border:1px solid var(--line);border-radius:var(--radius-lg);overflow:hidden;
-  background:#fff;transition:all .18s ease;display:flex;flex-direction:column;
+  border:1px solid var(--line);background:#fff;overflow:hidden;display:flex;flex-direction:column;
+  transition:all .16s ease;
 }
-.tile:hover{border-color:var(--line-strong);box-shadow:var(--shadow-md);transform:translateY(-2px)}
-.img{width:100%;height:170px;object-fit:cover;background:#f1f5f9;display:block}
-.meta{padding:10px 12px;font-size:12px;display:flex;flex-direction:column;gap:6px;border-top:1px solid var(--line)}
-.name{font-weight:600;font-size:13px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.small{color:var(--muted);font-size:11.5px}
+.tile:hover{border-color:var(--txt)}
+.img{width:100%;height:160px;object-fit:cover;background:#fafaf8;display:block}
+.meta{padding:10px 12px;font-size:11.5px;display:flex;flex-direction:column;gap:6px;border-top:1px solid var(--line)}
+.name{font-weight:500;font-size:12px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.small{color:var(--muted);font-size:10.5px;letter-spacing:.04em}
 
-.msg{min-height:20px;font-size:13px;font-weight:500;padding:6px 0}
-.muted{color:var(--muted);font-size:12.5px}
+.msg{min-height:18px;font-size:12px;font-weight:500;padding:4px 0;color:var(--danger);letter-spacing:.02em}
+
+.muted{color:var(--muted);font-size:11.5px}
 .sep{height:1px;background:var(--line);margin:14px 0}
 .hidden{display:none !important}
 
-/* Login */
-.login-shell{
-  border:1px solid var(--line);
-  background:linear-gradient(155deg,#ffffff 0%,#f8fafc 60%,#f0fdfa 100%);
-  box-shadow:var(--shadow-lg);padding:28px;
-}
-.login-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:18px}
-.login-head .title{margin:0;font-size:18px}
-.login-head .title::before{display:none}
-.login-badge{
-  font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
-  color:var(--brand-dark);background:var(--brand-bg);
-  border:1px solid #99f6e4;border-radius:999px;padding:5px 11px;font-weight:600;
-}
-.login-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.login-col{
-  border:1px solid var(--line);border-radius:var(--radius-lg);
-  padding:18px;background:#fff;
-}
-.login-col label.muted{display:block;font-size:12px;font-weight:500;margin-bottom:6px;color:var(--txt-soft);text-transform:uppercase;letter-spacing:.04em}
-.input-wrap{
-  display:flex;align-items:center;gap:8px;border:1px solid var(--line);
-  border-radius:var(--radius);padding:9px 12px;background:#fff;
-  transition:border-color .15s ease, box-shadow .15s ease;
-}
-.input-wrap:focus-within{border-color:var(--brand);box-shadow:0 0 0 3px rgba(13,148,136,.12)}
-.ghost-btn{background:#f1f5f9;color:var(--txt-soft);border:0;padding:5px 10px;border-radius:6px;font-size:12px;font-weight:500;box-shadow:none}
-.ghost-btn:hover{background:#e2e8f0;transform:none}
-.cta{width:100%;margin-top:14px;padding:11px 14px;font-size:14px}
+#pager{font-weight:500;color:var(--txt);padding:0 8px;font-family:var(--mono);font-size:11px}
+#statsTop, #who{font-size:10px;letter-spacing:.2em;color:var(--muted);text-transform:uppercase}
 
-.login-status{margin-top:14px;padding:12px 14px;border-radius:var(--radius);font-size:13px;font-weight:500;line-height:1.4}
-.login-status.error{background:var(--danger-light);border:1px solid #fecaca;color:#991b1b}
-.login-status.ok{background:var(--ok-light);border:1px solid #bbf7d0;color:#166534}
-.login-status.info{background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8}
-
-#pager{font-weight:500;color:var(--txt-soft);padding:0 8px}
-
-#statsTop, #who{font-size:12.5px}
-
-/* Tile internal controls — make sure existing inline buttons inherit nice styling */
-.tile button{font-size:12px;padding:6px 10px;border-radius:7px}
-.tile input, .tile select{font-size:12px;padding:6px 8px}
+.tile button{font-size:10px;padding:5px 10px;letter-spacing:.1em}
+.tile input,.tile select{font-size:11px;padding:5px 8px}
 .tile .row{gap:6px}
 
-/* Better scrollbars (WebKit) */
-*::-webkit-scrollbar{width:8px;height:8px}
+*::-webkit-scrollbar{width:6px;height:6px}
 *::-webkit-scrollbar-track{background:transparent}
-*::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:4px}
-*::-webkit-scrollbar-thumb:hover{background:#94a3b8}
+*::-webkit-scrollbar-thumb{background:rgba(0,0,0,.15);border-radius:0}
+*::-webkit-scrollbar-thumb:hover{background:rgba(0,0,0,.3)}
 
-@media (max-width:1280px){.grid{grid-template-columns:1fr}}
-@media (max-width:720px){
-  .wrap{padding:14px}
-  .hero{padding:18px;gap:14px}
-  .hero h1{font-size:20px}
-  .login-grid{grid-template-columns:1fr}
-  .login-shell{padding:20px}
-  .gallery{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
+@media (max-width:1280px){
+  .dx-grid{grid-template-columns:1fr}
+  .app-sidebar{width:200px}
+}
+@media (max-width:900px){
+  .diptych{grid-template-columns:1fr}
+  .dx-hero{padding:36px;min-height:280px}
+  .dx-hero-pitch h2{font-size:32px}
+  .dx-form{padding:36px}
+  .app-sidebar{width:64px}
+  .app-brand .wm,.nav-section,.nav-item span,.nav-user .meta{display:none}
+  .nav-item{justify-content:center;padding:14px}
+}
+@media (max-width:640px){
+  .app-content{padding:18px}
+  .page-header h1{font-size:26px}
+  .gallery{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
 }
 </style></head>
-<body><div class="wrap"><div class="hero"><img id="brandLogo" class="logo" src="" alt="logo"><div style="flex:1"><h1 id="brandName">Company Media Center</h1><p id="brandTag">Global gallery for all branches and customers</p></div></div>
-<div id="loginCard" class="card login-shell" style="margin-top:14px;max-width:680px;">
-  <div class="login-head">
-    <div>
-      <div class="title" style="margin:0">Secure Sign In</div>
-      <div class="muted" style="margin-top:4px">Use your team account or API key recovery access.</div>
+<body>
+
+<!-- ============ DIPTYCH LOGIN ============ -->
+<div id="loginCard" class="diptych">
+  <div class="dx-hero">
+    <div class="dx-hero-corner">
+      <img id="brandLogo" src="" alt="logo" />
+      <span class="wordmark" id="brandWordmark">Media Center</span>
     </div>
-    <div class="login-badge">Protected</div>
+    <div class="dx-hero-watermark">M</div>
+    <div class="dx-hero-pitch">
+      <div class="eyebrow">POS-Hub · Media Center</div>
+      <h2 id="brandName">Company Media Center</h2>
+      <p class="lead" id="brandTag">Global image gallery for all branches and customers.</p>
+    </div>
+    <div class="dx-hero-meta">
+      <span>v 2.4.0</span>
+      <span class="dot">Online</span>
+    </div>
   </div>
-  <div class="login-grid">
-    <div class="login-col">
+
+  <div class="dx-form">
+    <div class="dx-form-top">Forgot access?</div>
+    <div class="dx-form-body">
+      <div class="step">01 · Sign In</div>
+      <h1>Welcome back.</h1>
       <form id="loginForm" action="/gallery-admin/login" method="post" autocomplete="on">
         <input type="hidden" name="redirect_html" value="1" />
-        <label class="muted" for="loginUser">Username</label>
-        <input id="loginUser" name="username" placeholder="Username" autocomplete="username" spellcheck="false" autocapitalize="none" style="width:100%" />
-        <label class="muted" for="loginPass" style="margin-top:8px">Password</label>
-        <div class="input-wrap">
-          <input id="loginPass" name="password" type="password" placeholder="Password" autocomplete="current-password" style="flex:1;border:0;outline:0;padding:0;background:transparent" />
-          <button id="togglePassBtn" type="button" class="ghost-btn">Show</button>
+        <div class="dx-field">
+          <label for="loginUser">Username</label>
+          <input id="loginUser" name="username" placeholder="username" autocomplete="username" spellcheck="false" autocapitalize="none" />
         </div>
-        <button id="loginBtn" type="submit" class="ok cta">Sign In</button>
+        <div class="dx-field">
+          <label for="loginPass">Password</label>
+          <div class="input-wrap">
+            <input id="loginPass" name="password" type="password" placeholder="••••••••" autocomplete="current-password" />
+            <button id="togglePassBtn" type="button" class="ghost-btn">Show</button>
+          </div>
+        </div>
+        <button id="loginBtn" type="submit" class="dx-cta"><span>Sign In</span><span>→</span></button>
       </form>
-    </div>
-    <div class="login-col">
-      <form id="apiLoginForm" action="/gallery-admin/login" method="post" autocomplete="off">
+
+      <form id="apiLoginForm" action="/gallery-admin/login" method="post" autocomplete="off" class="dx-recovery">
         <input type="hidden" name="redirect_html" value="1" />
-        <div class="muted">Recovery</div>
-        <div class="muted" style="margin-top:4px">If password access fails, sign in with your API key and rotate credentials.</div>
-        <label class="muted" for="loginApiKey" style="margin-top:8px">API key</label>
-        <input id="loginApiKey" name="api_key" type="password" placeholder="API Key (recovery)" autocomplete="off" spellcheck="false" style="width:100%" />
-        <button id="apiLoginBtn" type="submit" class="alt cta">Login with API Key</button>
+        <div class="recovery-label">02 · Recovery</div>
+        <input id="loginApiKey" name="api_key" type="password" placeholder="pk_live_·······" autocomplete="off" spellcheck="false" />
+        <button id="apiLoginBtn" type="submit" class="dx-cta alt" style="margin-top:14px"><span>Recover with API Key</span><span>→</span></button>
       </form>
+
+      <div id="serverLoginNotice" class="__PRE_LOGIN_NOTICE_CLASS__">__PRE_LOGIN_NOTICE_TEXT__</div>
+      <div id="loginMsg" class="login-status hidden" role="status" aria-live="polite"></div>
     </div>
+    <div class="dx-form-bottom">© MindMeshLab · 2026</div>
   </div>
-  <div id="serverLoginNotice" class="__PRE_LOGIN_NOTICE_CLASS__">__PRE_LOGIN_NOTICE_TEXT__</div>
-  <div id="loginMsg" class="login-status hidden" role="status" aria-live="polite"></div>
 </div>
-<div id="appArea" class="hidden"><div class="toolbar card" style="margin-top:12px;"><span id="who" class="muted"></span><button class="alt" onclick="bootstrap()">Reload</button><button class="danger" onclick="logout()">Logout</button><span id="statsTop" class="muted"></span></div>
-<div class="grid"><div><div class="card"><div class="title">Categories</div><div class="row"><input id="newCat" placeholder="new category" style="flex:1" /><button class="ok" onclick="createCategory()">Create</button></div><div class="row" style="margin-top:8px"><select id="moveToCat" style="flex:1"></select><button class="danger" onclick="deleteCategory()">Delete</button></div><div class="row" style="margin-top:6px"><button class="alt" onclick="moveCategory(-1)">Move Up</button><button class="alt" onclick="moveCategory(1)">Move Down</button></div><div class="cats" id="catList" style="margin-top:8px"></div></div><div class="card" style="margin-top:10px;"><div class="title">Upload</div><input id="filesInput" type="file" accept=".png,.jpg,.jpeg,.webp" multiple /><div style="margin-top:6px"><input id="folderInput" type="file" webkitdirectory directory multiple /></div><div class="drop" id="dropZone" style="margin-top:8px">Drop image files/folders here</div><div class="row" style="margin-top:8px"><button class="ok" id="uploadBtn" onclick="uploadSelected()">Upload Selected</button><span id="uploadInfo" class="muted">0 files selected</span></div></div></div>
-<div class="card"><div class="toolbar"><div class="title" style="margin:0">Images</div><input id="search" placeholder="search..." oninput="loadItems(1)" /><button onclick="loadItems(pageState.page)">Refresh</button><select id="bulkMoveTo"></select><button class="alt" onclick="moveSelected()">Move Selected</button><button class="danger" onclick="deleteSelected()">Delete Selected</button><button class="alt" onclick="selectAllVisible()">Select Page</button><button class="alt" onclick="clearSelection()">Clear</button></div><div id="msg" class="msg"></div><div id="gallery" class="gallery"></div><div class="toolbar" style="margin-top:8px;"><button class="alt" onclick="prevPage()">Prev</button><span id="pager" class="muted"></span><button class="alt" onclick="nextPage()">Next</button><select id="pageSize" onchange="loadItems(1)"><option>60</option><option selected>120</option><option>240</option></select></div></div>
-<div><div class="card"><div class="title">Branding</div><input id="bName" placeholder="Company name" /><div style="margin-top:6px"><input id="bTag" placeholder="Tagline" /></div><div style="margin-top:6px"><input id="bLogo" placeholder="Logo URL (https://...)" /></div><div style="margin-top:6px"><textarea id="bAbout" placeholder="About text"></textarea></div><div class="row"><button class="ok" id="saveBrandBtn" onclick="saveBrand()">Save Branding</button></div></div><div id="usersCard" class="card" style="margin-top:10px;"><div class="title">Team Access</div><div class="row"><input id="uUser" placeholder="username" style="flex:1" /><select id="uRole"><option value="editor">editor</option><option value="admin">admin</option></select></div><div style="margin-top:6px"><input id="uName" placeholder="display name" /></div><div style="margin-top:6px"><input id="uPass" type="password" placeholder="password (new or change)" /></div><div class="row" style="margin-top:6px"><label><input id="uActive" type="checkbox" checked /> active</label><button class="ok" onclick="saveUser()">Save User</button></div><div class="sep"></div><div id="usersList" class="muted"></div></div><div class="card" style="margin-top:10px;"><div class="title">Top 10 Stats</div><div class="row"><button class="alt" onclick="loadTop('selected')">Top Selected</button><button class="alt" onclick="loadTop('downloaded')">Top Downloaded</button></div><div id="topList" class="muted" style="margin-top:8px"></div></div></div></div></div></div>
+
+<!-- ============ APP SHELL ============ -->
+<div id="appArea" class="app-shell hidden">
+  <aside class="app-sidebar">
+    <div class="app-brand">
+      <img id="brandLogoSide" src="" alt="" />
+      <div class="wm">Media<small>Center</small></div>
+    </div>
+    <div class="nav-section">Overview</div>
+    <button type="button" class="nav-item active" data-pane="dashboard"><span class="nav-icon">▦</span><span>Dashboard</span></button>
+    <button type="button" class="nav-item" data-pane="gallery"><span class="nav-icon">▥</span><span>Gallery</span></button>
+    <button type="button" class="nav-item" data-pane="categories"><span class="nav-icon">▤</span><span>Categories</span></button>
+    <button type="button" class="nav-item" data-pane="upload"><span class="nav-icon">↑</span><span>Upload</span></button>
+    <div class="nav-section">Settings</div>
+    <button type="button" class="nav-item" data-pane="users"><span class="nav-icon">●</span><span>Team</span></button>
+    <button type="button" class="nav-item" data-pane="branding"><span class="nav-icon">◆</span><span>Branding</span></button>
+    <button type="button" class="nav-item" data-pane="stats"><span class="nav-icon">▲</span><span>Statistics</span></button>
+    <div class="nav-spacer"></div>
+    <div class="nav-user">
+      <div class="avatar" id="userAvatar">·</div>
+      <div class="meta">
+        <div class="name" id="who">—</div>
+        <div class="role">Admin</div>
+      </div>
+      <button type="button" class="logout" onclick="logout()" title="Sign out">⎋</button>
+    </div>
+  </aside>
+
+  <main class="app-main">
+    <div class="app-topbar">
+      <div class="search-box">
+        <span>⌕</span>
+        <input id="search" placeholder="Search images…" oninput="loadItems(1)" />
+        <span class="kbd">⌘K</span>
+      </div>
+      <div class="topbar-spacer"></div>
+      <div class="topbar-actions">
+        <span id="statsTop"></span>
+        <button class="btn small" onclick="bootstrap()">↻ Reload</button>
+      </div>
+    </div>
+
+    <div class="app-content">
+      <div class="page-header">
+        <div>
+          <div class="meta" id="dateMeta">10 Mai 2026 · Media Center</div>
+          <h1>Welcome back.</h1>
+        </div>
+        <div class="stats" id="branchInfo">Synced</div>
+      </div>
+
+      <div class="dx-grid">
+        <!-- LEFT COLUMN: categories + upload -->
+        <div class="dx-col">
+          <div class="panel" data-section="categories">
+            <div class="panel-head">Categories <span class="count" id="catCount">0</span></div>
+            <div class="row" style="margin-bottom:10px">
+              <input id="newCat" placeholder="new category" style="flex:1" />
+              <button class="ok" onclick="createCategory()">Add</button>
+            </div>
+            <div class="row" style="margin-bottom:10px">
+              <select id="moveToCat" style="flex:1"></select>
+              <button class="danger" onclick="deleteCategory()">Del</button>
+            </div>
+            <div class="row" style="margin-bottom:14px">
+              <button class="alt" onclick="moveCategory(-1)" style="flex:1">↑ Up</button>
+              <button class="alt" onclick="moveCategory(1)" style="flex:1">↓ Down</button>
+            </div>
+            <div class="cats" id="catList"></div>
+          </div>
+
+          <div class="panel" data-section="upload">
+            <div class="panel-head">Upload</div>
+            <div style="margin-bottom:8px">
+              <label class="muted" style="display:block;font-size:9px;letter-spacing:.3em;text-transform:uppercase;margin-bottom:6px">Files</label>
+              <input id="filesInput" type="file" accept=".png,.jpg,.jpeg,.webp" multiple />
+            </div>
+            <div style="margin-bottom:10px">
+              <label class="muted" style="display:block;font-size:9px;letter-spacing:.3em;text-transform:uppercase;margin-bottom:6px">Or folder</label>
+              <input id="folderInput" type="file" webkitdirectory directory multiple />
+            </div>
+            <div class="drop" id="dropZone">Drop files / folders here</div>
+            <div class="row" style="margin-top:12px">
+              <button class="ok" id="uploadBtn" onclick="uploadSelected()" style="flex:1">↑ Upload</button>
+            </div>
+            <div id="uploadInfo" class="muted" style="margin-top:8px;font-size:10.5px;letter-spacing:.1em">0 files selected</div>
+          </div>
+        </div>
+
+        <!-- CENTER COLUMN: images grid -->
+        <div class="dx-col">
+          <div class="panel">
+            <div class="toolbar">
+              <div class="panel-head" style="margin:0">Images <span class="count" id="imgCount">0</span></div>
+              <div style="flex:1"></div>
+              <button onclick="loadItems(pageState.page)">↻ Refresh</button>
+              <select id="bulkMoveTo" style="min-width:120px"></select>
+              <button class="alt" onclick="moveSelected()">Move</button>
+              <button class="danger" onclick="deleteSelected()">Delete</button>
+              <button class="alt" onclick="selectAllVisible()">Select page</button>
+              <button class="alt" onclick="clearSelection()">Clear</button>
+            </div>
+            <div id="msg" class="msg"></div>
+            <div id="gallery" class="gallery"></div>
+            <div class="toolbar" style="margin-top:18px;border-bottom:0;padding-bottom:0">
+              <button class="alt" onclick="prevPage()">← Prev</button>
+              <span id="pager"></span>
+              <button class="alt" onclick="nextPage()">Next →</button>
+              <div style="flex:1"></div>
+              <select id="pageSize" onchange="loadItems(1)">
+                <option>60</option><option selected>120</option><option>240</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- RIGHT COLUMN: branding + users + stats -->
+        <div class="dx-col">
+          <div class="panel" data-section="branding">
+            <div class="panel-head">Branding</div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <input id="bName" class="in" placeholder="Company name" />
+              <input id="bTag" class="in" placeholder="Tagline" />
+              <input id="bLogo" class="in" placeholder="Logo URL (https://...)" />
+              <textarea id="bAbout" class="in" placeholder="About text"></textarea>
+              <button class="ok" id="saveBrandBtn" onclick="saveBrand()" style="margin-top:6px">Save Branding</button>
+            </div>
+          </div>
+
+          <div class="panel" id="usersCard" data-section="users">
+            <div class="panel-head">Team Access</div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <div class="row">
+                <input id="uUser" class="in" placeholder="username" style="flex:1" />
+                <select id="uRole">
+                  <option value="editor">editor</option>
+                  <option value="admin">admin</option>
+                </select>
+              </div>
+              <input id="uName" class="in" placeholder="display name" />
+              <input id="uPass" class="in" type="password" placeholder="password" />
+              <div class="row" style="margin-top:4px">
+                <label style="font-size:11px;color:var(--muted);display:flex;align-items:center;gap:6px;flex:1">
+                  <input id="uActive" type="checkbox" checked style="width:auto" /> active
+                </label>
+                <button class="ok" onclick="saveUser()">Save user</button>
+              </div>
+            </div>
+            <div class="sep"></div>
+            <div id="usersList" class="muted"></div>
+          </div>
+
+          <div class="panel" data-section="stats">
+            <div class="panel-head">Top 10 Stats</div>
+            <div class="row" style="margin-bottom:10px">
+              <button class="alt" onclick="loadTop('selected')" style="flex:1">Selected</button>
+              <button class="alt" onclick="loadTop('downloaded')" style="flex:1">Downloaded</button>
+            </div>
+            <div id="topList" class="muted"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
 <script>
 let categories = [], items = [], currentCategory = "all", selectedFiles = [], checked = new Set(), authUser = null, uploadInProgress = false, loginBusy = false;
 const PRE_LOGIN_NOTICE = __PRE_LOGIN_NOTICE__;
@@ -6272,7 +6592,11 @@ function renderAuth() {
   document.getElementById("loginCard").classList.toggle("hidden", ok);
   document.getElementById("appArea").classList.toggle("hidden", !ok);
   if (ok) {
-    document.getElementById("who").textContent = `User: ${authUser.username} (${authUser.role})`;
+    document.getElementById("who").textContent = authUser.username || "—";
+    const av = document.getElementById("userAvatar");
+    if (av) av.textContent = (authUser.username || "?").substring(0, 2).toUpperCase();
+    const roleSpans = document.querySelectorAll(".nav-user .role");
+    if (roleSpans.length) roleSpans[0].textContent = authUser.role || "";
     document.getElementById("usersCard").classList.toggle("hidden", authUser.role !== "admin");
     document.getElementById("saveBrandBtn").disabled = (authUser.role !== "admin");
   }
@@ -6286,6 +6610,8 @@ async function loadBrand() {
   document.getElementById("brandName").textContent = b.company_name || "Company Media Center";
   document.getElementById("brandTag").textContent = b.tagline || "Global gallery";
   document.getElementById("brandLogo").src = b.logo_url || "";
+  const sideLogo = document.getElementById("brandLogoSide"); if (sideLogo) sideLogo.src = b.logo_url || "";
+  const wm = document.getElementById("brandWordmark"); if (wm) wm.textContent = (b.company_name || "Media Center").toUpperCase();
   document.getElementById("bName").value = b.company_name || "";
   document.getElementById("bTag").value = b.tagline || "";
   document.getElementById("bLogo").value = b.logo_url || "";
