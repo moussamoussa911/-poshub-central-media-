@@ -1,0 +1,59 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #ffffff;
+  --color-bg-subtle: #f9f9f9;
+  --color-bg-hover: #f3f3f1;
+  --color-border: #ebebea;
+  --color-border-strong: #d8d8d6;
+  --color-text: #191918;
+  --color-text-muted: #6b6b67;
+  --color-text-subtle: #91918d;
+  --color-accent: #2563eb;
+  --color-accent-hover: #1d4ed8;
+  --color-danger: #dc2626;
+  --color-danger-bg: #fef2f2;
+  --color-success: #059669;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --radius-card: 0.5rem;
+}
+
+html,
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+/* Subtle scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 999px;
+  border: 2px solid var(--color-bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-subtle);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Focus ring */
+*:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}

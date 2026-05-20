@@ -1400,6 +1400,22 @@ def create_app(
     _init_schema(db_path)
 
     app = FastAPI(title="POS Hub", version="1.2.0")
+
+    from fastapi.middleware.cors import CORSMiddleware
+    _cors_origins_env = str(os.environ.get("POS_HUB_CORS_ORIGINS", "") or "").strip()
+    _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] or [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "X-API-Key", "X-Gallery-Session", "Authorization"],
+        max_age=600,
+    )
+
     app.mount("/static", StaticFiles(directory=str(dirs["STATIC_DIR"])), name="static")
 
     app.state.public_scheme = str(public_scheme or "https").strip().lower()
