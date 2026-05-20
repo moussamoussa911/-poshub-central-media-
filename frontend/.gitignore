@@ -15,7 +15,9 @@
 
 # next.js
 /.next/
-/out/
+# NOTE: /out/ is intentionally NOT ignored. The static export is committed
+# so the Python-only Render service can serve it without needing Node.js.
+# Rebuild with `cd frontend && npm run build` before committing.
 
 # production
 /build
@@ -32,6 +34,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env*.example
 
 # vercel
 .vercel

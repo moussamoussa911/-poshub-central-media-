@@ -1418,6 +1418,26 @@ def create_app(
 
     app.mount("/static", StaticFiles(directory=str(dirs["STATIC_DIR"])), name="static")
 
+    # --- New Next.js static-export frontend (Media Center v3) ---
+    # Built by `npm run build` in frontend/, output goes to frontend/out/.
+    # We serve _next/* assets and treat /gallery-admin/* (except API and login
+    # POST endpoints) as SPA routes that all return index.html.
+    _frontend_out = Path(__file__).resolve().parent / "frontend" / "out"
+    if _frontend_out.is_dir():
+        # Next-generated bundles (JS chunks, CSS, fonts, etc.)
+        _next_dir = _frontend_out / "_next"
+        if _next_dir.is_dir():
+            app.mount(
+                "/_next",
+                StaticFiles(directory=str(_next_dir)),
+                name="next_assets",
+            )
+        # Public assets (favicon.ico, *.svg, etc.) — mounted last via fallback.
+        app.state.frontend_out_dir = str(_frontend_out)
+    else:
+        app.state.frontend_out_dir = ""
+        log.info("[frontend] %s not found; old gallery-admin HTML will be served", _frontend_out)
+
     app.state.public_scheme = str(public_scheme or "https").strip().lower()
     app.state.public_port = int(public_port or 8766)
     app.state.public_http_port = int(public_http_port or 0)
@@ -5872,8 +5892,122 @@ def create_app(
                 "role": str(row.get("role") or "editor"),
             },
         }
+    def _serve_frontend_index() -> Optional["FileResponse"]:
+        out_dir_str = getattr(app.state, "frontend_out_dir", "")
+        if not out_dir_str:
+            return None
+        idx = Path(out_dir_str) / "index.html"
+        if not idx.is_file():
+            return None
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            str(idx),
+            media_type="text/html",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "same-origin",
+            },
+        )
+
+    def _serve_frontend_path(rel: str) -> Optional["FileResponse"]:
+        """Serve a static file from frontend/out, or fall back to index.html for SPA routes."""
+        out_dir_str = getattr(app.state, "frontend_out_dir", "")
+        if not out_dir_str:
+            return None
+        out_dir = Path(out_dir_str)
+        # Strip any leading slash and disallow path traversal.
+        rel = (rel or "").lstrip("/")
+        if ".." in rel.split("/"):
+            return None
+        from fastapi.responses import FileResponse
+        candidates = []
+        if rel:
+            p = out_dir / rel
+            if p.is_dir():
+                candidates.append(p / "index.html")
+            else:
+                candidates.append(p)
+                candidates.append(out_dir / f"{rel}.html")
+                candidates.append(out_dir / rel / "index.html")
+        for c in candidates:
+            if c.is_file():
+                # static asset
+                return FileResponse(str(c))
+        # SPA fallback — return index.html so client-side routing handles it.
+        idx = out_dir / "index.html"
+        if idx.is_file():
+            return FileResponse(
+                str(idx),
+                media_type="text/html",
+                headers={"Cache-Control": "no-store"},
+            )
+        return None
+
+    # Public static assets at the root of frontend/out (favicon.ico, *.svg, etc.)
+    # Mounted as individual routes to avoid greedy catch-alls that could mask
+    # other registered routes.
+    def _serve_root_asset(name: str):
+        out_dir_str = getattr(app.state, "frontend_out_dir", "")
+        if out_dir_str:
+            p = Path(out_dir_str) / name
+            if p.is_file():
+                from fastapi.responses import FileResponse
+                return FileResponse(str(p))
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("Not found", status_code=404)
+
+    for _asset_name in ("favicon.ico", "file.svg", "globe.svg", "next.svg", "vercel.svg", "window.svg"):
+        def _mk_asset_handler(n: str):
+            def _h():
+                return _serve_root_asset(n)
+            _h.__name__ = f"asset_{n.replace('.', '_')}"
+            return _h
+        app.get(f"/{_asset_name}")(_mk_asset_handler(_asset_name))
+
+    @app.get("/")
+    def root_redirect():
+        # Serve the new frontend at "/" when available; otherwise nudge the
+        # operator toward the legacy admin page.
+        r = _serve_frontend_index()
+        if r is not None:
+            return r
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/gallery-admin", status_code=302)
+
+    # Top-level SPA routes mapped to the static export.
+    # Each route's index.html is delivered; client-side React Router (next/navigation)
+    # then takes over for in-app navigation.
+    _SPA_ROUTES = ("/login", "/upload", "/settings")
+
+    for _spa in _SPA_ROUTES:
+        def _make_handler(rel: str):
+            def _handler():
+                r = _serve_frontend_path(rel.lstrip("/"))
+                if r is not None:
+                    return r
+                from fastapi.responses import PlainTextResponse
+                return PlainTextResponse("Not built", status_code=503)
+            _handler.__name__ = f"spa_route_{rel.strip('/').replace('/', '_') or 'root'}"
+            return _handler
+        app.get(_spa)(_make_handler(_spa))
+        app.get(_spa + "/")(_make_handler(_spa))
+
+    # Sub-paths under /settings/* (team, branding, etc.) — generic catch-all.
+    @app.get("/settings/{rel:path}")
+    def spa_settings_catchall(rel: str):
+        r = _serve_frontend_path(f"settings/{rel}")
+        if r is not None:
+            return r
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("Not found", status_code=404)
+
     @app.get("/gallery-admin")
     def gallery_admin_page(request: Request):
+        # If the new Next.js frontend is built, serve it instead of the legacy HTML.
+        new_ui = _serve_frontend_index()
+        if new_ui is not None:
+            return new_ui
         login_error = str(request.query_params.get("login_error") or "").strip()
         login_result = str(request.query_params.get("login_result") or "").strip().lower()
         login_bootstrap = str(request.query_params.get("lb") or "").strip()
