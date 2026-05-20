@@ -9,6 +9,10 @@ static/
 menu_images/
 local_server/
 
+# But DO commit the Next.js static export under frontend/out/.
+!frontend/out/
+!frontend/out/**
+
 # Python
 __pycache__/
 *.pyc
