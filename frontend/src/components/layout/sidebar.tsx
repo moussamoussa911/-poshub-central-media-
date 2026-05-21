@@ -35,7 +35,13 @@ const SETTINGS_NAV = [
 
 export function Sidebar({ activeCategory, onSelectCategory, onClose }: SidebarProps) {
   const pathname = usePathname();
-  const isGallery = pathname === "/";
+  // The gallery page is served at "/" by Next, but FastAPI also serves it
+  // at "/gallery-admin" for backwards compatibility with the legacy URL.
+  const isGallery =
+    pathname === "/" ||
+    pathname === "" ||
+    pathname === "/gallery-admin" ||
+    pathname === "/gallery-admin/";
   const { data } = useQuery({
     queryKey: ["categories"],
     queryFn: listCategories,
