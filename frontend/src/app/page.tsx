@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { listCategories, listGallery, type GalleryItem } from "@/lib/api";
+import { ApiError, listCategories, listGallery, type GalleryItem } from "@/lib/api";
 import { AppShell } from "@/components/layout/app-shell";
 import { ImageCard } from "@/components/gallery/image-card";
 import { ImageDetail } from "@/components/gallery/image-detail";
@@ -120,8 +120,27 @@ export default function GalleryPage() {
             Loading…
           </div>
         ) : galleryQ.isError ? (
-          <div className="text-sm rounded-md border border-[var(--color-danger)] bg-[var(--color-danger-bg)] text-[var(--color-danger)] p-4">
-            Failed to load: {(galleryQ.error as Error)?.message}
+          <div className="text-sm rounded-md border border-[var(--color-danger)] bg-[var(--color-danger-bg)] text-[var(--color-danger)] p-4 flex items-start justify-between gap-3">
+            <div>
+              {galleryQ.error instanceof ApiError && galleryQ.error.status === 429 ? (
+                <>
+                  <div className="font-medium">Slow down — rate limit reached.</div>
+                  <div className="mt-1 text-xs opacity-80">
+                    The server briefly capped requests from your IP. Wait a few seconds, then retry.
+                  </div>
+                </>
+              ) : (
+                <>Failed to load: {(galleryQ.error as Error)?.message}</>
+              )}
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => galleryQ.refetch()}
+              disabled={galleryQ.isFetching}
+            >
+              Retry
+            </Button>
           </div>
         ) : items.length === 0 ? (
           <div className="text-center py-16 text-[var(--color-text-muted)]">

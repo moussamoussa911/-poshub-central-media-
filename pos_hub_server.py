@@ -2187,7 +2187,15 @@ def create_app(
 
     def _is_unlimited_path(path: str) -> bool:
         p = str(path or "").lower()
-        return p in {"/health", "/.well-known/jwks.json", "/.well-known/auth-meta"}
+        if p in {"/health", "/.well-known/jwks.json", "/.well-known/auth-meta", "/favicon.ico"}:
+            return True
+        # Static assets — both the legacy /static (gallery images) and the
+        # Next.js bundle path /_next — are not rate-limited. A single page
+        # view can easily fire 50+ image GETs which would otherwise eat the
+        # whole budget.
+        if p.startswith("/static/") or p.startswith("/_next/"):
+            return True
+        return False
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
