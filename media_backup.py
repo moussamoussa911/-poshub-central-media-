@@ -85,6 +85,24 @@ def _verify_db(path: Path) -> None:
         con.close()
 
 
+def _install_verified_db(source: Path, target: Path) -> None:
+    """Stage on the persistent disk before the atomic replacement."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, staged_name = tempfile.mkstemp(
+        prefix=f".{target.name}.restore-",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
+    os.close(handle)
+    staged = Path(staged_name)
+    try:
+        shutil.copyfile(source, staged)
+        _verify_db(staged)
+        os.replace(staged, target)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
 def _snapshot_db(source: Path, destination: Path) -> None:
     src = sqlite3.connect(str(source), timeout=30.0)
     try:
@@ -242,7 +260,7 @@ def restore_latest_if_requested(*, data_dir: Path | str, db_path: Path | str) ->
         data_dir.mkdir(parents=True, exist_ok=True)
         if restored_static.exists():
             shutil.copytree(restored_static, static_dir, dirs_exist_ok=True)
-        os.replace(restored_db, db_path)
+        _install_verified_db(restored_db, db_path)
     _log(f"restored and verified {key}")
     return True
 

@@ -95,6 +95,13 @@ def test_encrypted_database_and_media_roundtrip(tmp_path: Path, monkeypatch) -> 
     target = tmp_path / "target"
     (target / "static" / "global_gallery").mkdir(parents=True)
     monkeypatch.setenv("BACKUP_RESTORE_LATEST", "1")
+    original_replace = media_backup.os.replace
+
+    def same_filesystem_replace(source_path, target_path):
+        assert Path(source_path).parent == Path(target_path).parent
+        return original_replace(source_path, target_path)
+
+    monkeypatch.setattr(media_backup.os, "replace", same_filesystem_replace)
     assert media_backup.restore_latest_if_requested(data_dir=target, db_path=target / "poshub.db")
     assert (target / "static" / "global_gallery" / "pizza" / "one.jpg").read_bytes() == b"fake-image-data"
     con = sqlite3.connect(target / "poshub.db")
