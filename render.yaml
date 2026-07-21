@@ -12,3 +12,21 @@
         value: https
       - key: POS_HUB_API_KEY
         sync: false
+      - key: BACKUP_S3_BUCKET
+        sync: false
+      - key: BACKUP_S3_ENDPOINT
+        sync: false
+      - key: BACKUP_S3_ACCESS_KEY
+        sync: false
+      - key: BACKUP_S3_SECRET_KEY
+        sync: false
+      - key: BACKUP_S3_REGION
+        sync: false
+      - key: BACKUP_REQUIRE_EU_REGION
+        value: "1"
+      - key: BACKUP_ENCRYPTION_KEY
+        sync: false
+      - key: BACKUP_RESTORE_LATEST
+        value: "0"
+      - key: BACKUP_RETENTION_DAYS
+        value: "30"

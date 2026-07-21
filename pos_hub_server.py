@@ -1397,7 +1397,18 @@ def create_app(
 ) -> FastAPI:
     dirs = _ensure_dirs(Path(data_dir).resolve() if data_dir else _default_data_dir())
     persist = _probe_persistence(dirs["DATA_DIR"])
+    try:
+        import media_backup
+        media_backup.restore_latest_if_requested(data_dir=dirs["DATA_DIR"], db_path=db_path)
+    except Exception as restore_exc:
+        if os.environ.get("BACKUP_RESTORE_LATEST", "").strip().lower() in ("1", "true", "yes", "on"):
+            raise RuntimeError(f"central-media migration restore failed: {restore_exc}") from restore_exc
     _init_schema(db_path)
+    try:
+        import media_backup
+        media_backup.start_scheduler(data_dir=dirs["DATA_DIR"], db_path=db_path)
+    except Exception as backup_exc:
+        log.warning("central-media backup scheduler did not start: %s", backup_exc)
 
     app = FastAPI(title="POS Hub", version="1.2.0")
 
@@ -8820,6 +8831,5 @@ if __name__ == "__main__":
         uvicorn.run(app, host="0.0.0.0", port=_PUBLIC_PORT, ssl_certfile=_cert, ssl_keyfile=_key, log_level="info")
     else:
         uvicorn.run(app, host="0.0.0.0", port=_PUBLIC_PORT, log_level="info")
-
 
 
