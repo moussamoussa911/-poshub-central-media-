@@ -1,6 +1,7 @@
 ﻿services:
   - type: web
     name: poshub-central-media
+    region: frankfurt
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
