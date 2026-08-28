@@ -16,3 +16,13 @@
         sync: false
       - key: BACKUP_RESTORE_LATEST
         value: "0"
+      # Full media snapshots are about 313 MB each. Seven daily recovery
+      # points leave safe headroom below the 10 GB B2 cap.
+      - key: BACKUP_RETENTION_DAYS
+        value: "7"
+      # Even after a longer outage, preserve seven distinct restore points.
+      - key: BACKUP_MIN_RECOVERY_POINTS
+        value: "7"
+      # Render restarts must not create another full snapshot immediately.
+      - key: BACKUP_MIN_INTERVAL_HOURS
+        value: "20"

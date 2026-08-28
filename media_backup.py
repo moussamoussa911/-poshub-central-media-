@@ -123,6 +123,84 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _backup_version_rows(s3, env: dict) -> list[dict]:
+    """Return every data version/delete marker owned by central-media."""
+    rows: list[dict] = []
+    paginator = s3.get_paginator("list_object_versions")
+    for page in paginator.paginate(Bucket=env["bucket"], Prefix=f"{_PREFIX}/"):
+        for obj in page.get("Versions", []) or []:
+            key = str(obj.get("Key") or "")
+            version_id = str(obj.get("VersionId") or "")
+            if not key.startswith(f"{_PREFIX}/") or not key.endswith(".tar.gz.enc") or not version_id:
+                continue
+            rows.append(
+                {
+                    "Key": key,
+                    "VersionId": version_id,
+                    "LastModified": obj["LastModified"],
+                    "Size": int(obj.get("Size") or 0),
+                    "DeleteMarker": False,
+                    "IsLatest": bool(obj.get("IsLatest")),
+                }
+            )
+        for obj in page.get("DeleteMarkers", []) or []:
+            key = str(obj.get("Key") or "")
+            version_id = str(obj.get("VersionId") or "")
+            if not key.startswith(f"{_PREFIX}/") or not key.endswith(".tar.gz.enc") or not version_id:
+                continue
+            rows.append(
+                {
+                    "Key": key,
+                    "VersionId": version_id,
+                    "LastModified": obj["LastModified"],
+                    "Size": 0,
+                    "DeleteMarker": True,
+                    "IsLatest": bool(obj.get("IsLatest")),
+                }
+            )
+    return rows
+
+
+def _visible_backup_rows(s3, env: dict) -> list[dict]:
+    rows: list[dict] = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=env["bucket"], Prefix=f"{_PREFIX}/"):
+        for obj in page.get("Contents", []) or []:
+            key = str(obj.get("Key") or "")
+            if not key.startswith(f"{_PREFIX}/") or not key.endswith(".tar.gz.enc"):
+                continue
+            rows.append(
+                {
+                    "Key": key,
+                    "LastModified": obj["LastModified"],
+                    "Size": int(obj.get("Size") or 0),
+                }
+            )
+    return rows
+
+
+def _latest_visible_backup_at(s3, env: dict) -> Optional[datetime]:
+    rows = _visible_backup_rows(s3, env)
+    return max((row["LastModified"] for row in rows), default=None)
+
+
+def _has_recent_backup(s3, env: dict, *, now: datetime) -> bool:
+    hours = max(0.0, float(os.environ.get("BACKUP_MIN_INTERVAL_HOURS", "20") or "20"))
+    if hours <= 0:
+        return False
+    latest = _latest_visible_backup_at(s3, env)
+    return bool(latest is not None and latest >= now - timedelta(hours=hours))
+
+
+def _try_prune(env: dict, *, s3, now: datetime, phase: str) -> Optional[tuple[int, int]]:
+    """Log cleanup failures without turning them into an upload outage."""
+    try:
+        return _prune(env, s3=s3, now=now)
+    except Exception as exc:
+        _log(f"{phase} prune failed: {exc}")
+        return None
+
+
 def run_once(*, data_dir: Path | str, db_path: Path | str, now: Optional[datetime] = None) -> bool:
     """Snapshot SQLite plus /static, encrypt it, and upload it to EU storage."""
     try:
@@ -137,6 +215,18 @@ def run_once(*, data_dir: Path | str, db_path: Path | str, now: Optional[datetim
             return False
         secret = _secret()
         now = now or datetime.now(timezone.utc)
+        s3 = _s3_client(env)
+        # Prune first so a full B2 cap can recover instead of blocking the
+        # upload that previously had to succeed before cleanup could run.
+        _try_prune(env, s3=s3, now=now, phase="pre-upload")
+        try:
+            if _has_recent_backup(s3, env, now=now):
+                _log("recent encrypted snapshot already exists; skipping duplicate startup backup")
+                return True
+        except Exception as exc:
+            # Listing is only a duplicate guard. A temporary list failure or
+            # a restricted key must never prevent creation of a new backup.
+            _log(f"could not check latest backup; proceeding with upload: {exc}")
         name = f"central-media_{now:%Y%m%dT%H%M%SZ}.tar.gz"
         with tempfile.TemporaryDirectory(prefix="central_media_backup_") as td:
             root = Path(td)
@@ -152,7 +242,8 @@ def run_once(*, data_dir: Path | str, db_path: Path | str, now: Optional[datetim
                     archive.add(static_dir, arcname="static", recursive=True)
             backup_crypto.encrypt_file(archive_path, encrypted_path, secret)
             key = f"{_PREFIX}/{now:%Y/%m/%d}/{encrypted_path.name}"
-            _s3_client(env).upload_file(
+            size_bytes = encrypted_path.stat().st_size
+            s3.upload_file(
                 str(encrypted_path),
                 env["bucket"],
                 key,
@@ -165,26 +256,75 @@ def run_once(*, data_dir: Path | str, db_path: Path | str, now: Optional[datetim
                     },
                 },
             )
-        _prune(env)
-        _log(f"uploaded encrypted database and media snapshot to {key}")
+        _try_prune(env, s3=s3, now=now, phase="post-upload")
+        _log(f"uploaded encrypted database and media snapshot to {key} ({size_bytes} bytes)")
         return True
     except Exception as exc:
         _log(f"backup failed: {exc}")
         return False
 
 
-def _prune(env: dict) -> None:
-    try:
-        retention = max(1, int(os.environ.get("BACKUP_RETENTION_DAYS", "30") or "30"))
-        cutoff = datetime.now(timezone.utc) - timedelta(days=retention)
-        s3 = _s3_client(env)
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=env["bucket"], Prefix=f"{_PREFIX}/"):
-            for obj in page.get("Contents", []) or []:
-                if obj["LastModified"] < cutoff:
-                    s3.delete_object(Bucket=env["bucket"], Key=obj["Key"])
-    except Exception as exc:
-        _log(f"prune failed: {exc}")
+def _prune(
+    env: dict,
+    *,
+    s3=None,
+    now: Optional[datetime] = None,
+) -> tuple[int, int]:
+    """Permanently delete expired B2 versions, never unversioned objects."""
+    retention = max(1, int(os.environ.get("BACKUP_RETENTION_DAYS", "7") or "7"))
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=retention)
+    s3 = s3 or _s3_client(env)
+    rows = _backup_version_rows(s3, env)
+
+    recoverable = [row for row in rows if not row["DeleteMarker"]]
+    visible = _visible_backup_rows(s3, env)
+    minimum_points = max(
+        1,
+        int(os.environ.get("BACKUP_MIN_RECOVERY_POINTS", "7") or "7"),
+    )
+    protected: set[tuple[str, str]] = set()
+    for visible_row in sorted(
+        visible,
+        key=lambda row: row["LastModified"],
+        reverse=True,
+    )[:minimum_points]:
+        candidates = [row for row in recoverable if row["Key"] == visible_row["Key"]]
+        if not candidates:
+            continue
+        current = max(
+            candidates,
+            key=lambda row: (bool(row.get("IsLatest")), row["LastModified"]),
+        )
+        protected.add((current["Key"], current["VersionId"]))
+
+    expired = [
+        row
+        for row in rows
+        if row["LastModified"] < cutoff
+        and (row["Key"], row["VersionId"]) not in protected
+    ]
+    # Remove data versions before their delete markers. All removals include a
+    # VersionId, which is required to release storage in versioned B2 buckets.
+    expired.sort(key=lambda row: (bool(row["DeleteMarker"]), row["LastModified"]))
+    deleted_bytes = sum(int(row.get("Size") or 0) for row in expired)
+    for offset in range(0, len(expired), 1000):
+        batch = expired[offset : offset + 1000]
+        response = s3.delete_objects(
+            Bucket=env["bucket"],
+            Delete={
+                "Objects": [
+                    {"Key": row["Key"], "VersionId": row["VersionId"]}
+                    for row in batch
+                ],
+                "Quiet": True,
+            },
+        )
+        errors = (response or {}).get("Errors", []) or []
+        if errors:
+            raise RuntimeError(f"permanent B2 prune rejected {len(errors)} object version(s)")
+    if expired:
+        _log(f"permanently pruned {len(expired)} version(s), {deleted_bytes} bytes")
+    return len(expired), deleted_bytes
 
 
 def _latest_key(env: dict) -> str:
@@ -269,7 +409,27 @@ def _loop(data_dir: Path, db_path: Path, interval_seconds: float, delay_seconds:
     time.sleep(delay_seconds)
     while True:
         run_once(data_dir=data_dir, db_path=db_path)
-        time.sleep(interval_seconds)
+        time.sleep(_next_scheduler_delay(interval_seconds))
+
+
+def _next_scheduler_delay(interval_seconds: float, *, now: Optional[datetime] = None) -> float:
+    """Keep the daily cadence even when a restart initially skips a backup."""
+    retry_seconds = min(interval_seconds, 15 * 60.0)
+    try:
+        env = _s3_env()
+        if not env:
+            return retry_seconds
+        latest = _latest_visible_backup_at(_s3_client(env), env)
+        if latest is None:
+            return retry_seconds
+        due_at = latest + timedelta(seconds=interval_seconds)
+        remaining = (due_at - (now or datetime.now(timezone.utc))).total_seconds()
+        if remaining <= 0:
+            return retry_seconds
+        return max(60.0, min(interval_seconds, remaining))
+    except Exception as exc:
+        _log(f"could not calculate next backup time: {exc}")
+        return retry_seconds
 
 
 def start_scheduler(*, data_dir: Path | str, db_path: Path | str) -> None:
