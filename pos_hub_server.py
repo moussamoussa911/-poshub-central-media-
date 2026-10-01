@@ -1712,6 +1712,169 @@ def _stock_fetch_provider(provider: str, q: str, per_page: int, page: int) -> tu
             pass
 
 
+# ── Photo files of the search results, served by this server ────────────────
+# Pixabay hands out image links (pixabay.com/get/...) that only work for the
+# server that ran the search; a till loading them directly gets HTTP 429.
+# Pixabay also asks to download images to one's own server. So every
+# thumb_url/image_url in a search answer points here instead: a signed token
+# names the provider URL, this server downloads it once (24 h temp cache,
+# outside /var/data so backups stay small) and hands the bytes to the till.
+# Only https URLs on the providers' hosts are accepted; the signature means
+# nobody can use this route as an open proxy.
+
+_STOCK_FILE_HOSTS = ("pixabay.com", "cdn.pixabay.com", "images.pexels.com")
+_STOCK_FILE_MAX_BYTES = 5 * 1024 * 1024  # the till refuses more anyway
+_STOCK_FILE_CACHE_TTL_S = 24 * 3600
+_STOCK_FILE_CACHE_MAX_FILES = 400
+_STOCK_FILE_RATE_LIMIT = 240  # downloads per caller address and minute
+_STOCK_FILE_TIMEOUT = (4.0, 10.0)
+_STOCK_FILE_RATE: "dict[str, list[float]]" = {}
+
+
+def _stock_file_host_ok(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url or ""))
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return parsed.scheme == "https" and host in _STOCK_FILE_HOSTS and not parsed.username and parsed.port in (None, 443)
+
+
+def _stock_file_sig(raw: str, secret: str) -> str:
+    return hmac.new(("poshub-stock-file-v1:" + str(secret or "")).encode("utf-8"),
+                    raw.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
+def _stock_file_token(url: str, secret: str) -> str:
+    raw = base64.urlsafe_b64encode(str(url).encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{raw}.{_stock_file_sig(raw, secret)}"
+
+
+def _stock_file_url_from_token(token: str, secret: str) -> str:
+    """Provider URL of a valid token, "" otherwise."""
+    raw, _, sig = str(token or "").partition(".")
+    if not raw or len(raw) > 4000 or not sig:
+        return ""
+    if not hmac.compare_digest(sig, _stock_file_sig(raw, secret)):
+        return ""
+    try:
+        url = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+    except Exception:
+        return ""
+    return url if _stock_file_host_ok(url) else ""
+
+
+def _stock_file_rate_allow(bucket: str, now: Optional[float] = None) -> bool:
+    now = time.time() if now is None else now
+    with _STOCK_LOCK:
+        hits = [t for t in _STOCK_FILE_RATE.get(bucket, []) if now - t < 60.0]
+        if len(hits) >= _STOCK_FILE_RATE_LIMIT:
+            _STOCK_FILE_RATE[bucket] = hits
+            return False
+        hits.append(now)
+        _STOCK_FILE_RATE[bucket] = hits
+        if len(_STOCK_FILE_RATE) > 5000:
+            for key in list(_STOCK_FILE_RATE.keys())[:1000]:
+                _STOCK_FILE_RATE.pop(key, None)
+        return True
+
+
+def _stock_file_cache_dir() -> Path:
+    path = Path(tempfile.gettempdir()) / "poshub_stock_files"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _stock_file_cache_prune(cache_dir: Path) -> None:
+    try:
+        files = [p for p in cache_dir.iterdir() if p.is_file()]
+    except Exception:
+        return
+    now = time.time()
+    keep = []
+    for p in files:
+        try:
+            if now - p.stat().st_mtime > _STOCK_FILE_CACHE_TTL_S:
+                p.unlink(missing_ok=True)
+            else:
+                keep.append(p)
+        except Exception:
+            pass
+    if len(keep) > _STOCK_FILE_CACHE_MAX_FILES:
+        keep.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+        for p in keep[: len(keep) - _STOCK_FILE_CACHE_MAX_FILES]:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _stock_file_download(url: str) -> tuple[bytes, str]:
+    """(bytes, content type) of a provider image. Raises ValueError("HTTP n"
+    / "kein Bild" / "zu groß" / "keine Verbindung") without URL or key."""
+
+    import requests
+
+    current = url
+    for _hop in range(4):
+        if not _stock_file_host_ok(current):
+            raise ValueError("unerlaubte Weiterleitung")
+        try:
+            resp = requests.get(current, stream=True, allow_redirects=False, verify=True,
+                                timeout=_STOCK_FILE_TIMEOUT,
+                                headers={"Accept": "image/*", "User-Agent": "M3-Bildserver/1.0"})
+        except Exception as exc:
+            raise ValueError("Zeitüberschreitung" if "Timeout" in type(exc).__name__ else "keine Verbindung") from None
+        try:
+            status = int(resp.status_code or 0)
+            if status in (301, 302, 303, 307, 308):
+                current = requests.compat.urljoin(current, str(resp.headers.get("Location") or ""))
+                continue
+            if status != 200:
+                raise ValueError(f"HTTP {status}")
+            ctype = str(resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if not ctype.startswith("image/"):
+                raise ValueError("kein Bild")
+            declared = int(resp.headers.get("Content-Length") or 0)
+            if declared > _STOCK_FILE_MAX_BYTES:
+                raise ValueError("zu groß")
+            data = bytearray()
+            for chunk in resp.iter_content(64 * 1024):
+                data.extend(chunk)
+                if len(data) > _STOCK_FILE_MAX_BYTES:
+                    raise ValueError("zu groß")
+            return bytes(data), ctype
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    raise ValueError("zu viele Weiterleitungen")
+
+
+def _stock_file_get(url: str) -> tuple[bytes, str]:
+    """Cached download (24 h, temp folder). Same errors as the download."""
+    cache_dir = _stock_file_cache_dir()
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    data_path = cache_dir / f"{digest}.bin"
+    type_path = cache_dir / f"{digest}.type"
+    try:
+        if data_path.is_file() and type_path.is_file() and time.time() - data_path.stat().st_mtime < _STOCK_FILE_CACHE_TTL_S:
+            return data_path.read_bytes(), type_path.read_text(encoding="ascii").strip() or "image/jpeg"
+    except Exception:
+        pass
+    data, ctype = _stock_file_download(url)
+    try:
+        tmp = cache_dir / f".{digest}.{uuid.uuid4().hex}.tmp"
+        tmp.write_bytes(data)
+        tmp.replace(data_path)
+        type_path.write_text(ctype, encoding="ascii")
+        _stock_file_cache_prune(cache_dir)
+    except Exception:
+        pass
+    return data, ctype
+
+
 def _stock_interleave(groups: Sequence[list]) -> list[dict]:
     out: list[dict] = []
     longest = max((len(g) for g in groups), default=0)
@@ -4073,7 +4236,38 @@ def create_app(
                     content={"detail": "Zu viele neue Suchanfragen – bitte später erneut versuchen."},
                     headers={"Retry-After": str(retry_after)},
                 )
-        return _stock_search(query, per_page_i, page_i)
+        result = _stock_search(query, per_page_i, page_i)
+        # The till loads thumbnails and the chosen photo from this server
+        # (Pixabay's links only work for the server that searched).
+        for item in result.get("items") or []:
+            for field in ("thumb_url", "image_url"):
+                provider_url = str(item.get(field) or "")
+                if _stock_file_host_ok(provider_url):
+                    item[field] = _stock_file_public_url(request, _stock_file_token(provider_url, api_key))
+        return result
+
+    def _stock_file_public_url(request: Request, token: str) -> str:
+        try:
+            return str(request.url_for("api_images_stock_file", token=token))
+        except Exception:
+            base = _request_base(request)["request_base"].rstrip("/")
+            return f"{base}/images/stock-file/{token}"
+
+    @app.get("/images/stock-file/{token}", name="api_images_stock_file")
+    def api_images_stock_file(token: str, request: Request):
+        """A photo of a search result, downloaded by this server (no key:
+        the signed token only names photos this server's search returned)."""
+        url = _stock_file_url_from_token(token, api_key)
+        if not url:
+            raise HTTPException(status_code=404, detail="Bild nicht gefunden")
+        if not _stock_file_rate_allow(_stock_client_ip(request, _request_ip(request))):
+            raise HTTPException(status_code=429, detail="Zu viele Bildabrufe – bitte kurz warten.")
+        try:
+            data, ctype = _stock_file_get(url)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=f"Bildanbieter: {exc}")
+        return Response(content=data, media_type=ctype,
+                        headers={"Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"})
 
     @api.get("/gallery/categories")
     def api_gallery_categories(

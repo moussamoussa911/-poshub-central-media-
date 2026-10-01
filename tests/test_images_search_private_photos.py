@@ -140,7 +140,10 @@ def test_search_maps_pixabay_and_never_leaks_the_key(server, monkeypatch):
     assert body["ok"] is True and body["providers"] == ["pixabay"]
     assert [it["id"] for it in body["items"]] == ["pixabay:123"]  # http-only hit dropped
     item = body["items"][0]
-    assert item["image_url"].startswith("https://cdn.pixabay.com/")
+    # The till loads the photos from this server, never from Pixabay itself.
+    assert "/images/stock-file/" in item["image_url"] and "/images/stock-file/" in item["thumb_url"]
+    token = item["image_url"].rsplit("/", 1)[1]
+    assert module._stock_file_url_from_token(token, KEY) == "https://cdn.pixabay.com/photo/pizza_1280.jpg"
     assert item["photographer_url"] == "https://pixabay.com/users/chef_anna-42/"
     assert item["license"] and item["attribution"]
     assert PIXABAY_SECRET not in resp.text
@@ -186,6 +189,91 @@ def test_trusted_proxy_hops_uses_the_proxy_written_address(server, monkeypatch):
     forged = client.get("/api/images/search", headers={**_headers(), "X-Forwarded-For": "2.2.2.2, 9.9.9.9"},
                         params={"q": "suppe"})
     assert forged.status_code == 429
+
+
+# ── photo files served by this server ───────────────────────────────────────
+
+def test_stock_file_is_downloaded_once_and_served_without_a_key(server, monkeypatch, tmp_path):
+    module, client, _data = server
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    calls = []
+
+    def fake_download(url):
+        calls.append(url)
+        return b"\xff\xd8\xff" + b"j" * 50, "image/jpeg"
+
+    monkeypatch.setattr(module, "_stock_file_download", fake_download)
+    token = module._stock_file_token("https://pixabay.com/get/abc_640.jpg", KEY)
+    first = client.get(f"/images/stock-file/{token}")
+    assert first.status_code == 200 and first.headers["content-type"] == "image/jpeg"
+    assert first.content.startswith(b"\xff\xd8\xff")
+    second = client.get(f"/images/stock-file/{token}")
+    assert second.status_code == 200 and second.content == first.content
+    assert calls == ["https://pixabay.com/get/abc_640.jpg"]  # second answer from the cache
+
+
+def test_stock_file_rejects_tampered_tokens_and_foreign_hosts(server, monkeypatch):
+    module, client, _data = server
+    monkeypatch.setattr(module, "_stock_file_download", lambda url: pytest.fail("no download expected"))
+    token = module._stock_file_token("https://pixabay.com/get/abc.jpg", KEY)
+    raw, sig = token.split(".")
+    assert client.get(f"/images/stock-file/{raw}.{'0' * 32}").status_code == 404
+    assert client.get(f"/images/stock-file/{raw}").status_code == 404
+    # Signed with another secret: invalid here.
+    other = module._stock_file_token("https://pixabay.com/get/abc.jpg", "another-secret")
+    assert client.get(f"/images/stock-file/{other}").status_code == 404
+    # Even a correctly signed URL on a foreign host is never fetched.
+    foreign = module._stock_file_token("https://evil.example/x.jpg", KEY)
+    assert client.get(f"/images/stock-file/{foreign}").status_code == 404
+    http_url = module._stock_file_token("http://pixabay.com/get/abc.jpg", KEY)
+    assert client.get(f"/images/stock-file/{http_url}").status_code == 404
+
+
+def test_stock_file_provider_error_is_a_short_502(server, monkeypatch, tmp_path):
+    module, client, _data = server
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path / "tmp2"))
+
+    def failing(url):
+        raise ValueError("HTTP 429")
+
+    monkeypatch.setattr(module, "_stock_file_download", failing)
+    token = module._stock_file_token("https://pixabay.com/get/zzz.jpg", KEY)
+    resp = client.get(f"/images/stock-file/{token}")
+    assert resp.status_code == 502 and resp.json()["detail"] == "Bildanbieter: HTTP 429"
+
+
+def test_stock_file_download_follows_redirects_only_to_provider_hosts(server, monkeypatch):
+    module, _client, _data = server
+    import requests
+
+    class _Resp:
+        def __init__(self, status, headers=None, body=b""):
+            self.status_code = status
+            self.headers = headers or {}
+            self._body = body
+
+        def iter_content(self, size):
+            yield self._body
+
+        def close(self):
+            pass
+
+    seen = []
+
+    def fake_get(url, **kwargs):
+        seen.append(url)
+        if url.endswith("/get/start.jpg"):
+            return _Resp(302, {"Location": "https://cdn.pixabay.com/photo/final.jpg"})
+        if url.endswith("/photo/final.jpg"):
+            return _Resp(200, {"Content-Type": "image/jpeg", "Content-Length": "4"}, b"\xff\xd8\xffx")
+        return _Resp(302, {"Location": "https://evil.example/steal.jpg"})
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    data, ctype = module._stock_file_download("https://pixabay.com/get/start.jpg")
+    assert data == b"\xff\xd8\xffx" and ctype == "image/jpeg"
+    with pytest.raises(ValueError):
+        module._stock_file_download("https://pixabay.com/get/bad.jpg")
+    assert "https://evil.example/steal.jpg" not in seen
 
 
 # ── private customer photos ─────────────────────────────────────────────────
