@@ -40,7 +40,7 @@ import secrets
 from urllib.parse import quote, urlparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Sequence
 from contextvars import ContextVar
 
 from fastapi import (
@@ -59,6 +59,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from starlette.requests import Request
 from pydantic import BaseModel, Field, ConfigDict
+
+# Same module as app_core/image_pipeline.py in the POS repository (copied
+# 1:1): owner tokens, scope folders, attribution texts, public-URL checks.
+import image_pipeline as _image_pipeline
 
 log = logging.getLogger("poshub")
 _REQ_CTX: ContextVar[Optional[Request]] = ContextVar("poshub_request_ctx", default=None)
@@ -1381,6 +1385,394 @@ class AdminOutboxActionRequest(BaseModel):
     kind: str = "both"  # orders | menu | both
     include_pending: bool = False
     reset_tries: bool = True
+
+
+# ── Private customer photos (POS Paket 2) ───────────────────────────────────
+# Every till talks to this server with the same fixed key, so the key cannot
+# tell restaurants apart. A till that sends its private X-Image-Owner token
+# gets its uploads in its own folder static/menu_images/o_<hash>/ and sees
+# global_gallery plus that folder only. Without the header (gallery admin,
+# Media Center, older tills) everything stays as before: global_gallery.
+
+def _env_flag(name: str) -> Optional[bool]:
+    raw = str(os.environ.get(name, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _running_on_render() -> bool:
+    return str(os.environ.get("RENDER", "") or "").strip().lower() == "true"
+
+
+def _image_tenant_scope_enabled() -> bool:
+    """Uploads with a JWT / per-tenant key go into the tenant's folder on
+    Render; POS_HUB_IMAGE_TENANT_SCOPE=0/1 overrides."""
+
+    forced = _env_flag("POS_HUB_IMAGE_TENANT_SCOPE")
+    if forced is not None:
+        return forced
+    return _running_on_render()
+
+
+def _image_owner_scope_for(auth_obj: Optional[dict], owner_header: Optional[str]) -> str:
+    """Storage scope of an upload/list call: "t_…", "o_…" or "" (global).
+
+    Raises HTTPException 400 for a malformed X-Image-Owner header.
+    """
+
+    auth_obj = auth_obj or {}
+    kind = str(auth_obj.get("kind") or "")
+    tid = str(auth_obj.get("tenant_id") or "").strip()
+    if kind in ("jwt", "api_key") and tid and _image_tenant_scope_enabled():
+        return _image_pipeline.tenant_scope_folder(tid)
+    token = str(owner_header or "").strip()
+    if not token:
+        return ""
+    if not _image_pipeline.is_valid_owner_token(token):
+        raise HTTPException(status_code=400, detail="Ungültiger X-Image-Owner-Header")
+    return _image_pipeline.owner_scope_folder(token)
+
+
+# ── Photo search proxy (Pexels / Pixabay) ────────────────────────────────────
+# Same proxy as the POS hub (pos_hub_server.py in the POS repository). The
+# API keys stay on this server (env PEXELS_API_KEY / PIXABAY_API_KEY) and
+# never appear in responses or logs. Results are cached for 24 h (Pixabay
+# asks for that) and callers are rate limited.
+
+_STOCK_PROVIDER_LINKS = dict(_image_pipeline.PROVIDER_LINKS)
+_STOCK_CACHE_TTL_S = 24 * 3600
+_STOCK_CACHE_MAX = 500
+_STOCK_RATE_LIMIT = 30
+_STOCK_RATE_WINDOW_S = 60.0
+# Outbound budget per provider and hour (Pexels allows 200/h by default).
+_STOCK_OUTBOUND_PER_HOUR = 180
+# ... and per day where the provider has a monthly quota: Pexels allows
+# 20,000 requests a month by default, 600 a day stay below it even when the
+# hourly budget is used up around the clock.
+_STOCK_OUTBOUND_PER_DAY = {"pexels": 600}
+# Searches one caller (key + address) may send per hour that the cache
+# cannot answer, so one till cannot use up the budget every restaurant shares.
+_STOCK_CALLER_UNCACHED_PER_HOUR = 60
+_STOCK_TIMEOUT = (3.0, 6.0)
+_STOCK_TOTAL_BUDGET_S = 8.0
+_STOCK_LOCK = threading.Lock()
+_STOCK_CACHE: "dict[tuple, tuple[float, list]]" = {}
+_STOCK_RATE: "dict[str, list[float]]" = {}
+_STOCK_OUTBOUND: "dict[str, list[float]]" = {}
+_STOCK_CALLER_UNCACHED: "dict[str, list[float]]" = {}
+
+
+def _stock_http_get(url: str, *, params: dict, headers: dict, timeout: Any):
+    """Outbound request of the search proxy (TLS always verified)."""
+
+    import requests
+
+    return requests.get(url, params=params, headers=headers, timeout=timeout, verify=True)
+
+
+def _stock_configured_providers() -> list[str]:
+    out = []
+    if str(os.environ.get("PEXELS_API_KEY", "") or "").strip():
+        out.append("pexels")
+    if str(os.environ.get("PIXABAY_API_KEY", "") or "").strip():
+        out.append("pixabay")
+    return out
+
+
+def _stock_client_ip(request: Request, fallback: str) -> str:
+    """Caller address for the search rate limit.
+
+    POS_HUB_TRUSTED_PROXY_HOPS=N (Render alone: 1) takes the N-th
+    X-Forwarded-For entry from the right, the one Render's proxy wrote; the
+    client cannot forge it. 0 (default) keeps the server's usual address.
+    """
+
+    try:
+        hops = max(0, min(5, int(str(os.environ.get("POS_HUB_TRUSTED_PROXY_HOPS", "0") or "0").strip())))
+    except Exception:
+        hops = 0
+    if hops >= 1:
+        try:
+            parts = [p.strip() for p in str(request.headers.get("x-forwarded-for") or "").split(",") if p.strip()]
+        except Exception:
+            parts = []
+        if parts:
+            return parts[max(0, len(parts) - hops)]
+        try:
+            if request.client and request.client.host:
+                return str(request.client.host)
+        except Exception:
+            pass
+        return "unknown"
+    return fallback
+
+
+def _stock_rate_allow(bucket: str, now: Optional[float] = None) -> tuple[bool, int]:
+    now = time.time() if now is None else now
+    with _STOCK_LOCK:
+        hits = [t for t in _STOCK_RATE.get(bucket, []) if now - t < _STOCK_RATE_WINDOW_S]
+        if len(hits) >= _STOCK_RATE_LIMIT:
+            _STOCK_RATE[bucket] = hits
+            retry = int(max(1.0, _STOCK_RATE_WINDOW_S - (now - hits[0])) + 0.999)
+            return False, retry
+        hits.append(now)
+        _STOCK_RATE[bucket] = hits
+        if len(_STOCK_RATE) > 5000:
+            for key in list(_STOCK_RATE.keys())[:1000]:
+                _STOCK_RATE.pop(key, None)
+        return True, 0
+
+
+def _stock_cache_get(key: tuple) -> Optional[list]:
+    with _STOCK_LOCK:
+        hit = _STOCK_CACHE.get(key)
+        if not hit:
+            return None
+        ts, items = hit
+        if time.time() - ts > _STOCK_CACHE_TTL_S:
+            _STOCK_CACHE.pop(key, None)
+            return None
+        return [dict(x) for x in items]
+
+
+def _stock_cache_put(key: tuple, items: list) -> None:
+    with _STOCK_LOCK:
+        _STOCK_CACHE.pop(key, None)
+        _STOCK_CACHE[key] = (time.time(), [dict(x) for x in items])
+        while len(_STOCK_CACHE) > _STOCK_CACHE_MAX:
+            oldest = min(_STOCK_CACHE.items(), key=lambda kv: kv[1][0])[0]
+            _STOCK_CACHE.pop(oldest, None)
+
+
+def _stock_outbound_allow(provider: str) -> bool:
+    now = time.time()
+    day_cap = int(_STOCK_OUTBOUND_PER_DAY.get(provider, 0) or 0)
+    window = 86400.0 if day_cap else 3600.0
+    with _STOCK_LOCK:
+        hits = [t for t in _STOCK_OUTBOUND.get(provider, []) if now - t < window]
+        last_hour = sum(1 for t in hits if now - t < 3600.0)
+        if last_hour >= _STOCK_OUTBOUND_PER_HOUR or (day_cap and len(hits) >= day_cap):
+            _STOCK_OUTBOUND[provider] = hits
+            return False
+        hits.append(now)
+        _STOCK_OUTBOUND[provider] = hits
+        return True
+
+
+def _stock_is_cached(q: str, per_page: int, page: int) -> bool:
+    """Every configured provider can answer this search from the cache."""
+    for provider in _stock_configured_providers():
+        if _stock_cache_get((provider, q.casefold(), int(page), int(per_page))) is None:
+            return False
+    return True
+
+
+def _stock_caller_uncached_allow(bucket: str, now: Optional[float] = None) -> tuple[bool, int]:
+    now = time.time() if now is None else now
+    with _STOCK_LOCK:
+        hits = [t for t in _STOCK_CALLER_UNCACHED.get(bucket, []) if now - t < 3600.0]
+        if len(hits) >= _STOCK_CALLER_UNCACHED_PER_HOUR:
+            _STOCK_CALLER_UNCACHED[bucket] = hits
+            return False, int(max(1.0, 3600.0 - (now - hits[0])) + 0.999)
+        hits.append(now)
+        _STOCK_CALLER_UNCACHED[bucket] = hits
+        if len(_STOCK_CALLER_UNCACHED) > 5000:
+            for key in list(_STOCK_CALLER_UNCACHED.keys())[:1000]:
+                _STOCK_CALLER_UNCACHED.pop(key, None)
+        return True, 0
+
+
+def _stock_https(url: Any) -> str:
+    text = str(url or "").strip()
+    if text.lower().startswith("https://") and _image_pipeline.is_public_image_url(text):
+        return text
+    return ""
+
+
+def _stock_int(value: Any) -> int:
+    try:
+        return max(0, int(float(value)))
+    except Exception:
+        return 0
+
+
+def _stock_map_pexels(raw: Any) -> list[dict]:
+    photos = raw.get("photos") if isinstance(raw, dict) else None
+    out: list[dict] = []
+    for photo in photos if isinstance(photos, list) else []:
+        if not isinstance(photo, dict):
+            continue
+        src = photo.get("src") if isinstance(photo.get("src"), dict) else {}
+        thumb = _stock_https(src.get("medium") or src.get("small"))
+        image = _stock_https(src.get("large2x") or src.get("large") or src.get("original"))
+        if not thumb or not image:
+            continue
+        name = _image_pipeline.clean_attribution(photo.get("photographer"))[:80]
+        out.append({
+            "provider": "pexels",
+            "id": f"pexels:{_stock_int(photo.get('id')) or str(photo.get('id') or '')[:40]}",
+            "thumb_url": thumb,
+            "image_url": image,
+            "width": _stock_int(photo.get("width")),
+            "height": _stock_int(photo.get("height")),
+            "license": _image_pipeline.LICENSE_PEXELS,
+            "attribution": _image_pipeline.pexels_attribution(name),
+            "source_url": _image_pipeline.clean_source_url(photo.get("url")) or _STOCK_PROVIDER_LINKS["pexels"],
+            "photographer": name,
+            "photographer_url": _image_pipeline.clean_source_url(photo.get("photographer_url")),
+        })
+    return out
+
+
+def _stock_map_pixabay(raw: Any) -> list[dict]:
+    hits = raw.get("hits") if isinstance(raw, dict) else None
+    out: list[dict] = []
+    for hit in hits if isinstance(hits, list) else []:
+        if not isinstance(hit, dict):
+            continue
+        thumb = _stock_https(hit.get("webformatURL") or hit.get("previewURL"))
+        image = _stock_https(hit.get("largeImageURL") or hit.get("webformatURL"))
+        if not thumb or not image:
+            continue
+        user = _image_pipeline.clean_attribution(hit.get("user"))[:80]
+        user_id = _stock_int(hit.get("user_id"))
+        user_url = ""
+        if user and user_id and re.match(r"^[A-Za-z0-9_.-]+$", user):
+            user_url = f"https://pixabay.com/users/{user}-{user_id}/"
+        out.append({
+            "provider": "pixabay",
+            "id": f"pixabay:{_stock_int(hit.get('id')) or str(hit.get('id') or '')[:40]}",
+            "thumb_url": thumb,
+            "image_url": image,
+            "width": _stock_int(hit.get("imageWidth")),
+            "height": _stock_int(hit.get("imageHeight")),
+            "license": _image_pipeline.LICENSE_PIXABAY,
+            "attribution": _image_pipeline.pixabay_attribution(user),
+            "source_url": _image_pipeline.clean_source_url(hit.get("pageURL")) or _STOCK_PROVIDER_LINKS["pixabay"],
+            "photographer": user,
+            "photographer_url": user_url,
+        })
+    return out
+
+
+def _stock_fetch_provider(provider: str, q: str, per_page: int, page: int) -> tuple[list[dict], str]:
+    """(items, error). Errors are short texts without any key or URL."""
+
+    cache_key = (provider, q.casefold(), int(page), int(per_page))
+    cached = _stock_cache_get(cache_key)
+    if cached is not None:
+        return cached, ""
+    if not _stock_outbound_allow(provider):
+        return [], "Kontingent erschöpft"
+    try:
+        if provider == "pexels":
+            resp = _stock_http_get(
+                "https://api.pexels.com/v1/search",
+                params={"query": q, "per_page": per_page, "page": page, "locale": "de-DE"},
+                headers={"Authorization": str(os.environ.get("PEXELS_API_KEY", "")).strip(),
+                         "Accept": "application/json"},
+                timeout=_STOCK_TIMEOUT,
+            )
+        else:
+            resp = _stock_http_get(
+                "https://pixabay.com/api/",
+                params={
+                    "key": str(os.environ.get("PIXABAY_API_KEY", "")).strip(),
+                    "q": q,
+                    "lang": "de",
+                    "image_type": "photo",
+                    "safesearch": "true",
+                    "per_page": per_page,
+                    "page": page,
+                },
+                headers={"Accept": "application/json"},
+                timeout=_STOCK_TIMEOUT,
+            )
+    except Exception as exc:
+        name = type(exc).__name__
+        return [], ("Zeitüberschreitung" if "Timeout" in name else "keine Verbindung")
+    try:
+        status = int(getattr(resp, "status_code", 0) or 0)
+        if status != 200:
+            return [], f"HTTP {status}"
+        try:
+            raw = resp.json()
+        except Exception:
+            return [], "ungültige Antwort"
+        items = _stock_map_pexels(raw) if provider == "pexels" else _stock_map_pixabay(raw)
+        _stock_cache_put(cache_key, items)
+        return items, ""
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
+def _stock_interleave(groups: Sequence[list]) -> list[dict]:
+    out: list[dict] = []
+    longest = max((len(g) for g in groups), default=0)
+    for idx in range(longest):
+        for group in groups:
+            if idx < len(group):
+                out.append(group[idx])
+    return out
+
+
+def _stock_search(q: str, per_page: int, page: int) -> dict:
+    providers = _stock_configured_providers()
+    if not providers:
+        return {
+            "ok": False,
+            "configured": False,
+            "items": [],
+            "detail": "Die Fotosuche ist auf dem Bild-Server nicht eingerichtet.",
+            "provider_links": dict(_STOCK_PROVIDER_LINKS),
+        }
+    results: dict[str, tuple[list[dict], str]] = {}
+    from concurrent.futures import ThreadPoolExecutor, wait
+
+    pool = ThreadPoolExecutor(max_workers=len(providers), thread_name_prefix="stock-search")
+    try:
+        futures = {name: pool.submit(_stock_fetch_provider, name, q, per_page, page) for name in providers}
+        wait(list(futures.values()), timeout=_STOCK_TOTAL_BUDGET_S)
+        for name, fut in futures.items():
+            if fut.done():
+                try:
+                    results[name] = fut.result()
+                except Exception:
+                    results[name] = ([], "Fehler")
+            else:
+                results[name] = ([], "Zeitüberschreitung")
+    finally:
+        pool.shutdown(wait=False)
+    errors = {name: err for name, (_items, err) in results.items() if err}
+    items = _stock_interleave([results[name][0] for name in providers])
+    if len(errors) == len(providers):
+        return {
+            "ok": False,
+            "configured": True,
+            "query": q,
+            "providers": providers,
+            "items": [],
+            "errors": errors,
+            "detail": "Bildanbieter nicht erreichbar.",
+            "provider_links": dict(_STOCK_PROVIDER_LINKS),
+        }
+    out = {
+        "ok": True,
+        "configured": True,
+        "query": q,
+        "providers": providers,
+        "items": items,
+        "provider_links": dict(_STOCK_PROVIDER_LINKS),
+    }
+    if errors:
+        out["errors"] = errors
+    return out
 
 
 # ------------------------------
@@ -3419,12 +3811,48 @@ def create_app(
         category: str = Form("all"),
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth_gallery_admin(request, x_api_key)
+        auth_obj = _auth_gallery_admin(request, x_api_key)
+        # POS Paket 2: a till that sends its private X-Image-Owner token
+        # stores in its own folder, not in the gallery every restaurant sees.
+        # Without the header (gallery admin, Media Center, older tills)
+        # nothing changes.
+        owner_scope = _image_owner_scope_for(auth_obj, request.headers.get(_image_pipeline.IMAGE_OWNER_HEADER))
 
         original = os.path.basename((file.filename or "").strip() or "image.png")
         ext = os.path.splitext(original)[1].lower()
         if ext not in (".png", ".jpg", ".jpeg", ".webp"):
             ext = ".png"
+
+        if owner_scope:
+            own_dir = (Path(POS_HUB_MENU_IMG_DIR) / owner_scope).resolve()
+            own_dir.mkdir(parents=True, exist_ok=True)
+            own_name = f"{uuid.uuid4().hex}{ext}"
+            own_tmp = (own_dir / f".__tmp_{uuid.uuid4().hex}{ext}").resolve()
+            try:
+                with open(own_tmp, "wb") as f:
+                    while True:
+                        chunk = await file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            finally:
+                try:
+                    await file.close()
+                except Exception:
+                    pass
+            try:
+                own_tmp.replace(own_dir / own_name)
+            except Exception:
+                shutil.move(str(own_tmp), str(own_dir / own_name))
+            own_rel_url = f"/static/menu_images/{owner_scope}/{own_name}"
+            return {
+                "ok": True,
+                "filename": own_name,
+                "category": "Meine Bilder",
+                "image_url": _coerce_image_url(request, own_rel_url),
+                "image_url_rel": own_rel_url,
+                "scope": owner_scope,
+            }
 
         # Store all shared media in global_gallery/<category>/...
         # Keep menu_images only for backward compatibility with older data.
@@ -3497,14 +3925,38 @@ def create_app(
         page_size: int = 120,
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth_gallery_admin(request, x_api_key)
+        auth_obj = _auth_gallery_admin(request, x_api_key)
+        owner_scope = _image_owner_scope_for(auth_obj, request.headers.get(_image_pipeline.IMAGE_OWNER_HEADER))
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         cat = re.sub(r"[^a-z0-9_\-]+", "_", str(category or "all").strip().lower()).strip("_") or "all"
         qq = str(q or "").strip().lower()
         page_num = max(1, int(page or 1))
         ps = min(500, max(10, int(page_size or 120)))
         files = []
-        if cat == "all":
+        own_files = []
+        # POS Paket 2: the caller's own folder ("Meine Bilder") next to the
+        # shared gallery. Other restaurants' folders (o_*/t_*) are never listed.
+        if owner_scope and _image_pipeline.is_scope_folder_name(owner_scope) and cat in ("all", "meine_bilder"):
+            own_dir = (Path(POS_HUB_MENU_IMG_DIR) / owner_scope).resolve()
+            if own_dir.is_dir():
+                for fp in sorted(own_dir.iterdir(), key=lambda p: p.name.lower()):
+                    if not fp.is_file() or fp.name.startswith(".") or fp.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                        continue
+                    rel_url = f"/static/menu_images/{owner_scope}/{fp.name}"
+                    item = {
+                        "name": fp.name,
+                        "category": "Meine Bilder",
+                        "rel_path": f"menu_images/{owner_scope}/{fp.name}",
+                        "url": _coerce_image_url(request, rel_url),
+                        "size": int(fp.stat().st_size if fp.exists() else 0),
+                        "owner": "own",
+                    }
+                    if qq and qq not in f"{item['name']} {item['category']}".lower():
+                        continue
+                    own_files.append(item)
+        if cat == "meine_bilder" and owner_scope:
+            pass
+        elif cat == "all":
             for fp in root.rglob("*"):
                 if not fp.is_file():
                     continue
@@ -3545,6 +3997,12 @@ def create_app(
                         continue
                     files.append(item)
         files.sort(key=lambda x: (str(x.get("category") or ""), str(x.get("name") or "")))
+        if owner_scope:
+            # A till with its owner token tells shared and own photos apart
+            # (it never copies its own ones into the shared list).
+            for it in files:
+                it["owner"] = "global"
+            files = own_files + files
         total = len(files)
         start = (page_num - 1) * ps
         end = start + ps
@@ -3566,6 +4024,56 @@ def create_app(
             "total_pages": total_pages,
             "items": page_items,
         }
+
+    @api.get("/images/search")
+    @app.get("/images/search")
+    def api_images_search(
+        request: Request,
+        q: str = "",
+        per_page: int = 12,
+        page: int = 1,
+        x_api_key: Optional[str] = Header(default=None),
+    ):
+        """Photo search proxy for dishes without a barcode (Pexels, Pixabay).
+
+        Called by the POS (Speisen → "📷 Foto online suchen"); same contract
+        as the POS hub's /api/images/search.
+        """
+        auth_obj = _auth(x_api_key)
+        query = re.sub(r"\s+", " ", str(q or "")).strip()
+        if len(query) < 2 or len(query) > 80:
+            raise HTTPException(status_code=422, detail="Suchbegriff fehlt oder ist zu lang.")
+        try:
+            per_page_i = min(30, max(3, int(per_page)))
+        except Exception:
+            per_page_i = 12
+        try:
+            page_i = min(10, max(1, int(page)))
+        except Exception:
+            page_i = 1
+        ident = str(auth_obj.get("sub") or auth_obj.get("kind") or "")
+        key_part = hashlib.sha256(f"{ident}|{_norm_key(x_api_key)}".encode("utf-8")).hexdigest()[:16]
+        bucket = f"{key_part}|{_stock_client_ip(request, _request_ip(request))}"
+        allowed, retry_after = _stock_rate_allow(bucket)
+        if not allowed:
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Zu viele Suchanfragen – bitte kurz warten."},
+                headers={"Retry-After": str(retry_after)},
+            )
+        if not _stock_is_cached(query, per_page_i, page_i):
+            allowed, retry_after = _stock_caller_uncached_allow(bucket)
+            if not allowed:
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Zu viele neue Suchanfragen – bitte später erneut versuchen."},
+                    headers={"Retry-After": str(retry_after)},
+                )
+        return _stock_search(query, per_page_i, page_i)
 
     @api.get("/gallery/categories")
     def api_gallery_categories(
