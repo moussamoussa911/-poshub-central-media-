@@ -111,6 +111,7 @@ def _pixabay_payload():
         "hits": [
             {
                 "id": 123,
+                "previewURL": "https://cdn.pixabay.com/photo/2017/12/09/08/18/pizza-123_150.jpg",
                 "webformatURL": "https://cdn.pixabay.com/photo/pizza_640.jpg",
                 "largeImageURL": "https://cdn.pixabay.com/photo/pizza_1280.jpg",
                 "imageWidth": 1280,
@@ -142,8 +143,14 @@ def test_search_maps_pixabay_and_never_leaks_the_key(server, monkeypatch):
     item = body["items"][0]
     # The till loads the photos from this server, never from Pixabay itself.
     assert "/images/stock-file/" in item["image_url"] and "/images/stock-file/" in item["thumb_url"]
+    # ... and the server takes them from Pixabay's public CDN, not from the
+    # rate-limited pixabay.com/get/ links.
     token = item["image_url"].rsplit("/", 1)[1]
-    assert module._stock_file_url_from_token(token, KEY) == "https://cdn.pixabay.com/photo/pizza_1280.jpg"
+    assert module._stock_file_url_from_token(token, KEY) == \
+        "https://cdn.pixabay.com/photo/2017/12/09/08/18/pizza-123_1280.jpg"
+    thumb_token = item["thumb_url"].rsplit("/", 1)[1]
+    assert module._stock_file_url_from_token(thumb_token, KEY) == \
+        "https://cdn.pixabay.com/photo/2017/12/09/08/18/pizza-123_640.jpg"
     assert item["photographer_url"] == "https://pixabay.com/users/chef_anna-42/"
     assert item["license"] and item["attribution"]
     assert PIXABAY_SECRET not in resp.text
@@ -240,6 +247,24 @@ def test_stock_file_provider_error_is_a_short_502(server, monkeypatch, tmp_path)
     token = module._stock_file_token("https://pixabay.com/get/zzz.jpg", KEY)
     resp = client.get(f"/images/stock-file/{token}")
     assert resp.status_code == 502 and resp.json()["detail"] == "Bildanbieter: HTTP 429"
+
+
+def test_small_pixabay_originals_fall_back_to_a_smaller_cdn_size(server, monkeypatch, tmp_path):
+    module, client, _data = server
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path / "tmp3"))
+    tried = []
+
+    def fake_download(url):
+        tried.append(url.rsplit("-", 1)[1])
+        if url.endswith("_640.jpg"):
+            return b"\xff\xd8\xffsmall", "image/jpeg"
+        raise ValueError("HTTP 404")
+
+    monkeypatch.setattr(module, "_stock_file_download", fake_download)
+    token = module._stock_file_token("https://cdn.pixabay.com/photo/2020/01/01/00/00/soup-7_1280.jpg", KEY)
+    resp = client.get(f"/images/stock-file/{token}")
+    assert resp.status_code == 200 and resp.content == b"\xff\xd8\xffsmall"
+    assert tried == ["7_1280.jpg", "7_960.jpg", "7_640.jpg"]
 
 
 def test_stock_file_download_follows_redirects_only_to_provider_hosts(server, monkeypatch):

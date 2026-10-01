@@ -1633,8 +1633,17 @@ def _stock_map_pixabay(raw: Any) -> list[dict]:
     for hit in hits if isinstance(hits, list) else []:
         if not isinstance(hit, dict):
             continue
-        thumb = _stock_https(hit.get("webformatURL") or hit.get("previewURL"))
-        image = _stock_https(hit.get("largeImageURL") or hit.get("webformatURL"))
+        # Pixabay's pixabay.com/get/... links answer HTTP 429 after a couple
+        # of downloads. The same photo is on the public CDN: previewURL is
+        # cdn.pixabay.com/photo/..._150.jpg and _640/_1280 are its larger
+        # sizes (_stock_file_get falls back to _960/_640 when one is missing).
+        cdn = re.match(r"^(https://cdn\.pixabay\.com/photo/.+)_\d+\.(jpe?g|png)$", _stock_https(hit.get("previewURL")))
+        if cdn:
+            thumb = f"{cdn.group(1)}_640.{cdn.group(2)}"
+            image = f"{cdn.group(1)}_1280.{cdn.group(2)}"
+        else:
+            thumb = _stock_https(hit.get("webformatURL") or hit.get("previewURL"))
+            image = _stock_https(hit.get("largeImageURL") or hit.get("webformatURL"))
         if not thumb or not image:
             continue
         user = _image_pipeline.clean_attribution(hit.get("user"))[:80]
@@ -1863,7 +1872,22 @@ def _stock_file_get(url: str) -> tuple[bytes, str]:
             return data_path.read_bytes(), type_path.read_text(encoding="ascii").strip() or "image/jpeg"
     except Exception:
         pass
-    data, ctype = _stock_file_download(url)
+    try:
+        data, ctype = _stock_file_download(url)
+    except ValueError as exc:
+        # A small original has no 1280 px size on Pixabay's CDN.
+        smaller = re.match(r"^(https://cdn\.pixabay\.com/photo/.+)_1280\.(jpe?g|png)$", url)
+        if str(exc) != "HTTP 404" or not smaller:
+            raise
+        last = exc
+        for size in ("960", "640"):
+            try:
+                data, ctype = _stock_file_download(f"{smaller.group(1)}_{size}.{smaller.group(2)}")
+                break
+            except ValueError as inner:
+                last = inner
+        else:
+            raise last
     try:
         tmp = cache_dir / f".{digest}.{uuid.uuid4().hex}.tmp"
         tmp.write_bytes(data)
