@@ -29,6 +29,7 @@ def server(tmp_path, monkeypatch):
     monkeypatch.setenv("POS_HUB_DATA_DIR", str(data_dir))
     monkeypatch.setenv("POS_HUB_API_KEY", KEY)
     monkeypatch.setenv("POS_HUB_PUBLIC_SCHEME", "http")
+    monkeypatch.setenv("POS_HUB_GALLERY_ADMIN_PASSWORD", "gallery-owner-test-pass")
     for name in ("PEXELS_API_KEY", "PIXABAY_API_KEY", "RENDER", "POS_HUB_TRUSTED_PROXY_HOPS",
                  "POS_HUB_IMAGE_TENANT_SCOPE", "BACKUP_ENABLED"):
         monkeypatch.delenv(name, raising=False)

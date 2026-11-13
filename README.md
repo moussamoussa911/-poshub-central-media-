@@ -16,8 +16,15 @@ Central POS-Hub backend for shared menu image gallery across all customers.
 4. Add env vars:
    - `POS_HUB_DATA_DIR=/var/data`
    - `POS_HUB_PUBLIC_SCHEME=https`
-   - `POS_HUB_API_KEY=<YOUR_STRONG_KEY>`
+   - `POS_HUB_API_KEY=<YOUR_STRONG_KEY>` (master key: gallery admin, scripts; required,
+     on Render it is never read from a file)
+   - `POS_HUB_GALLERY_ADMIN_PASSWORD=<at least 12 characters>` (owner of the gallery admin;
+     required, the service does not start without it)
+   - `POS_HUB_CLIENT_KEYS=<key1>,<key2>` (optional: keys of the tills; they may read the
+     gallery, upload, search photos and track picks, nothing else)
 5. Attach a **Persistent Disk** mounted at `/var/data`.
+
+`poshub_runtime.json` (local runs only) is ignored by git and must never be committed.
 
 ## What is stored on disk
 - `/var/data/static/global_gallery` (uploaded shared gallery images)

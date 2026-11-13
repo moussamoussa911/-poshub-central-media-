@@ -14,6 +14,12 @@
         value: https
       - key: POS_HUB_API_KEY
         sync: false
+      # Owner of the gallery admin; the service does not start without it.
+      - key: POS_HUB_GALLERY_ADMIN_PASSWORD
+        sync: false
+      # Keys of the tills (read/upload/search only), comma separated.
+      - key: POS_HUB_CLIENT_KEYS
+        sync: false
       - key: BACKUP_RESTORE_LATEST
         value: "0"
       # Full media snapshots are about 313 MB each. Seven daily recovery

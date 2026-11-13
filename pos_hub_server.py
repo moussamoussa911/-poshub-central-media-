@@ -190,6 +190,15 @@ def _default_db_path() -> Path:
     return data_dir / "poshub.db"
 
 
+def _api_key_must_come_from_env() -> bool:
+    """On Render (or when forced) the master key comes only from the
+    environment: the repository never carries one, and the server must not
+    invent a random one there (tills would then fail without a clear error)."""
+    if str(os.environ.get("POS_HUB_REQUIRE_ENV_KEY", "") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    return bool(str(os.environ.get("RENDER", "") or "").strip())
+
+
 def _default_api_key() -> str:
     env_key = (
         os.environ.get("POS_HUB_API_KEY", "").strip()
@@ -197,6 +206,8 @@ def _default_api_key() -> str:
     )
     if env_key:
         return env_key
+    if _api_key_must_come_from_env():
+        return ""
     try:
         from poshub_runtime import load_poshub_runtime  # local import to avoid hard dependency during module import
         cfg = load_poshub_runtime(default_url="https://127.0.0.1:8766", default_key="")
@@ -314,12 +325,51 @@ def _jwt_now() -> int:
 
 
 def _jwt_secret() -> str:
-    return (
+    """Signing secret for tokens and gallery sessions. There is no built-in
+    fallback: without POS_HUB_JWT_SECRET/JWT_SECRET the master API key signs."""
+    secret = (
         os.environ.get("POS_HUB_JWT_SECRET", "").strip()
         or os.environ.get("JWT_SECRET", "").strip()
         or os.environ.get("POS_HUB_API_KEY", "").strip()
-        or "poshub-dev-secret-change-me"
+        or os.environ.get("POS_HUB_KEY", "").strip()
+        or str(globals().get("KEY") or "").strip()
     )
+    if not secret:
+        raise RuntimeError("No signing secret: set POS_HUB_JWT_SECRET or POS_HUB_API_KEY.")
+    return secret
+
+
+# Gallery owner password (A3): required, no built-in value, never the API key.
+GALLERY_ADMIN_PASSWORD_MIN_LEN = 12
+
+
+def _gallery_admin_password_from_env() -> str:
+    pwd = str(os.environ.get("POS_HUB_GALLERY_ADMIN_PASSWORD", "") or "").strip()
+    if len(pwd) < GALLERY_ADMIN_PASSWORD_MIN_LEN:
+        raise RuntimeError(
+            "POS_HUB_GALLERY_ADMIN_PASSWORD must be set (at least "
+            f"{GALLERY_ADMIN_PASSWORD_MIN_LEN} characters). The gallery admin has no built-in password."
+        )
+    return pwd
+
+
+def _client_keys() -> list[str]:
+    """Keys for tills (POS_HUB_CLIENT_KEYS, comma separated).
+
+    A till key may read the gallery, upload, search photos and track picks. It
+    cannot manage the gallery (users, brand, delete/move/rename) and is not
+    accepted anywhere else on this server. This lets the master key be
+    replaced while tills that still carry an older key keep working.
+    """
+    raw = str(os.environ.get("POS_HUB_CLIENT_KEYS", "") or "")
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+def _is_client_key(raw_key: Optional[str]) -> bool:
+    got = _norm_key(raw_key)
+    if not got:
+        return False
+    return any(hmac.compare_digest(got, k) for k in _client_keys())
 
 
 def _jwt_alg() -> str:
@@ -2053,7 +2103,8 @@ def create_app(
     _GALLERY_COOKIE = "gallery_admin_session"
     _GALLERY_TTL_SEC = int(_env_int("POS_HUB_GALLERY_SESSION_TTL_SEC", 12 * 3600, 900, 7 * 24 * 3600))
     _GALLERY_BOOTSTRAP_TTL_SEC = int(_env_int("POS_HUB_GALLERY_BOOTSTRAP_TTL_SEC", 300, 30, 3600))
-    _GALLERY_ROLE_RANK = {"editor": 10, "admin": 20}
+    _GALLERY_ROLE_RANK = {"client": 0, "editor": 10, "admin": 20}
+    _gallery_session_epoch = {"value": ""}
 
     def _gallery_pwd_hash(password: str, salt_hex: Optional[str] = None) -> tuple[str, str]:
         salt = bytes.fromhex(salt_hex) if (salt_hex and len(str(salt_hex)) >= 16) else os.urandom(16)
@@ -2145,10 +2196,55 @@ def create_app(
                     ),
                 )
             admin_user_env = str(os.environ.get("POS_HUB_GALLERY_ADMIN_USER", "admin") or "admin").strip().lower()
-            admin_pwd_env = str(os.environ.get("POS_HUB_GALLERY_ADMIN_PASSWORD", "") or "").strip()
+            # A3: the owner password comes only from the environment. Without it the
+            # service does not start (no built-in value, never the API key).
+            admin_pwd_env = _gallery_admin_password_from_env()
             force_admin_reset = str(os.environ.get("POS_HUB_GALLERY_ADMIN_FORCE_RESET", "") or "").strip().lower() in {
                 "1", "true", "yes", "on",
             }
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gallery_admin_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+            def _meta_get(key: str) -> str:
+                r0 = con.execute("SELECT value FROM gallery_admin_meta WHERE key=?", (key,)).fetchone()
+                if r0 is None:
+                    return ""
+                return str(r0["value"] if isinstance(r0, sqlite3.Row) else r0[0])
+
+            def _meta_set(key: str, value: str) -> None:
+                con.execute(
+                    "INSERT INTO gallery_admin_meta(key,value,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    (key, value, _now()),
+                )
+
+            def _set_owner_password() -> None:
+                h, s = _gallery_pwd_hash(admin_pwd_env)
+                ts = _now()
+                con.execute(
+                    """
+                    INSERT INTO gallery_admin_users(username,display_name,role,pwd_hash,pwd_salt,active,created_at,updated_at,last_login_at)
+                    VALUES(?,?,?,?,?,?,?,?,NULL)
+                    ON CONFLICT(username) DO UPDATE SET
+                        display_name=excluded.display_name,
+                        role=excluded.role,
+                        pwd_hash=excluded.pwd_hash,
+                        pwd_salt=excluded.pwd_salt,
+                        active=1,
+                        updated_at=excluded.updated_at
+                    """,
+                    (admin_user_env, "Owner", "admin", h, s, 1, ts, ts),
+                )
+
+            def _new_session_epoch() -> None:
+                _meta_set("session_epoch", secrets.token_hex(16))
 
             # Bootstrap one admin user.
             c = con.execute("SELECT COUNT(*) AS n FROM gallery_admin_users").fetchone()
@@ -2159,42 +2255,46 @@ def create_app(
             except Exception:
                 existing_users = 0
             if existing_users <= 0:
-                u = admin_user_env
-                p = admin_pwd_env
-                if not p:
-                    p = str(api_key or "").strip()
-                    if p:
-                        log.warning("[gallery-admin] POS_HUB_GALLERY_ADMIN_PASSWORD not set; using POS_HUB_API_KEY as initial admin password.")
-                if not p:
-                    p = "ChangeMe123!"
-                    log.warning("[gallery-admin] using fallback initial admin password. Set POS_HUB_GALLERY_ADMIN_PASSWORD.")
-                h, s = _gallery_pwd_hash(p)
-                ts = _now()
-                con.execute(
-                    "INSERT INTO gallery_admin_users(username,display_name,role,pwd_hash,pwd_salt,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (u, "Owner", "admin", h, s, 1, ts, ts),
+                _set_owner_password()
+                _meta_set("owner_password_v2", _now())
+                _new_session_epoch()
+            elif not _meta_get("owner_password_v2"):
+                # Older versions could create the owner with a built-in password or
+                # with the API key. Replace it once with the configured password,
+                # lock every account whose password is the API key, and end all
+                # open sessions.
+                _set_owner_password()
+                locked = 0
+                api_key_now = str(api_key or "").strip()
+                if api_key_now:
+                    for row in con.execute(
+                        "SELECT username, pwd_hash, pwd_salt FROM gallery_admin_users WHERE active=1"
+                    ).fetchall():
+                        uname = str(row["username"] if isinstance(row, sqlite3.Row) else row[0])
+                        if uname == admin_user_env:
+                            continue
+                        ph = str(row["pwd_hash"] if isinstance(row, sqlite3.Row) else row[1])
+                        ps = str(row["pwd_salt"] if isinstance(row, sqlite3.Row) else row[2])
+                        if _gallery_pwd_verify(api_key_now, ph, ps):
+                            con.execute(
+                                "UPDATE gallery_admin_users SET active=0, updated_at=? WHERE username=?",
+                                (_now(), uname),
+                            )
+                            locked += 1
+                _meta_set("owner_password_v2", _now())
+                _new_session_epoch()
+                log.warning(
+                    "[gallery-admin] owner password replaced from POS_HUB_GALLERY_ADMIN_PASSWORD; "
+                    "%d account(s) with the API key as password locked; all sessions ended.",
+                    locked,
                 )
             elif force_admin_reset:
-                if not admin_pwd_env:
-                    log.warning("[gallery-admin] POS_HUB_GALLERY_ADMIN_FORCE_RESET is set but POS_HUB_GALLERY_ADMIN_PASSWORD is empty; skipping reset.")
-                else:
-                    h, s = _gallery_pwd_hash(admin_pwd_env)
-                    ts = _now()
-                    con.execute(
-                        """
-                        INSERT INTO gallery_admin_users(username,display_name,role,pwd_hash,pwd_salt,active,created_at,updated_at,last_login_at)
-                        VALUES(?,?,?,?,?,?,?,?,NULL)
-                        ON CONFLICT(username) DO UPDATE SET
-                            display_name=excluded.display_name,
-                            role=excluded.role,
-                            pwd_hash=excluded.pwd_hash,
-                            pwd_salt=excluded.pwd_salt,
-                            active=1,
-                            updated_at=excluded.updated_at
-                        """,
-                        (admin_user_env, "Owner", "admin", h, s, 1, ts, ts),
-                    )
-                    log.warning("[gallery-admin] forced admin password reset applied for user '%s'.", admin_user_env)
+                _set_owner_password()
+                _new_session_epoch()
+                log.warning("[gallery-admin] forced admin password reset applied for user '%s'.", admin_user_env)
+            if not _meta_get("session_epoch"):
+                _new_session_epoch()
+            _gallery_session_epoch["value"] = _meta_get("session_epoch")
             con.commit()
         finally:
             con.close()
@@ -2476,11 +2576,11 @@ def create_app(
             _gallery_revoked_sessions.pop(k, None)
 
     def _gallery_session_secret() -> str:
-        # Per-feature secret override; falls back to JWT secret.
-        s = str(os.environ.get("POS_HUB_GALLERY_SESSION_SECRET", "") or "").strip()
-        if s:
-            return s
-        return _jwt_secret()
+        # Per-feature secret override; falls back to JWT secret. The epoch from
+        # the database is mixed in: a new epoch ends every open session.
+        s = str(os.environ.get("POS_HUB_GALLERY_SESSION_SECRET", "") or "").strip() or _jwt_secret()
+        epoch = str(_gallery_session_epoch.get("value") or "")
+        return f"{s}|{epoch}" if epoch else s
 
     def _gallery_session_sign(payload: dict) -> str:
         p_b64 = _b64url_encode(_json_dumps(payload).encode("utf-8"))
@@ -2606,8 +2706,19 @@ def create_app(
                 "display_name": str(row.get("display_name") or ""),
                 "role": str(row.get("role") or "editor"),
             }
-        # 2) Fallback API key header (for scripts/tools)
+        # 2) Till key (POS_HUB_CLIENT_KEYS): read, upload, search, track only.
+        if _is_client_key(x_api_key):
+            client = {"kind": "client_key", "tenant_id": "", "location_id": "", "sub": "client"}
+            _AUTH_CTX.set(client)
+            return dict(client, username="client_key", display_name="Kasse", role="client")
+        # 3) Fallback API key header (for scripts/tools). Only the master key
+        #    manages the gallery; tenant keys and tokens are tills.
         base = _auth(x_api_key)
+        if str(base.get("kind") or "") != "legacy_api_key":
+            base["username"] = "api_key"
+            base["display_name"] = "Kasse"
+            base["role"] = "client"
+            return base
         base["username"] = "api_key"
         base["display_name"] = "API Key"
         base["role"] = "admin"
@@ -2992,11 +3103,8 @@ def create_app(
         received_raw = raw_key
         received = _norm_key(received_raw)
         expected = _norm_key(api_key)
-        if received and received == expected:
+        if received and expected and hmac.compare_digest(received, expected):
             return {"kind": "legacy_api_key", "tenant_id": "", "location_id": "", "sub": "legacy"}
-        tkey_obj = _load_active_api_key_tenant(received)
-        if tkey_obj is not None:
-            return tkey_obj
         log.warning(
             "AUTH FAIL (gallery recovery): got value=%s len=%d mask=%s | expected len=%d mask=%s",
             "present" if received_raw is not None else "missing",
@@ -4226,7 +4334,10 @@ def create_app(
         Called by the POS (Speisen → "📷 Foto online suchen"); same contract
         as the POS hub's /api/images/search.
         """
-        auth_obj = _auth(x_api_key)
+        if _is_client_key(x_api_key):
+            auth_obj = {"kind": "client_key", "tenant_id": "", "location_id": "", "sub": "client"}
+        else:
+            auth_obj = _auth(x_api_key)
         query = re.sub(r"\s+", " ", str(q or "")).strip()
         if len(query) < 2 or len(query) > 80:
             raise HTTPException(status_code=422, detail="Suchbegriff fehlt oder ist zu lang.")
@@ -4335,7 +4446,7 @@ def create_app(
         name: str = Form(...),
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(_auth_gallery_admin(request, x_api_key), "editor")
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         cat = re.sub(r"[^a-z0-9_\-]+", "_", str(name or "").strip().lower()).strip("_")
         if not cat:
@@ -4352,7 +4463,7 @@ def create_app(
         move_to: str = "all",
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(_auth_gallery_admin(request, x_api_key), "editor")
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         cat = re.sub(r"[^a-z0-9_\-]+", "_", str(name or "").strip().lower()).strip("_")
         mv = re.sub(r"[^a-z0-9_\-]+", "_", str(move_to or "all").strip().lower()).strip("_") or "all"
@@ -4403,7 +4514,7 @@ def create_app(
         new_category: str = Form(...),
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(_auth_gallery_admin(request, x_api_key), "editor")
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         safe_rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
         if not safe_rel or ".." in safe_rel:
@@ -4436,7 +4547,7 @@ def create_app(
         new_name: str = Form(...),
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(_auth_gallery_admin(request, x_api_key), "editor")
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         safe_rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
         if not safe_rel or ".." in safe_rel:
@@ -4468,7 +4579,7 @@ def create_app(
         file: UploadFile = File(...),
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(_auth_gallery_admin(request, x_api_key), "editor")
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         safe_rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
         if not safe_rel or ".." in safe_rel:
@@ -4521,7 +4632,7 @@ def create_app(
         rel_path: str,
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(_auth_gallery_admin(request, x_api_key), "editor")
         root = Path(POS_HUB_GLOBAL_GALLERY_DIR).resolve()
         safe_rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
         if not safe_rel or ".." in safe_rel:
@@ -4546,7 +4657,7 @@ def create_app(
         request: Request,
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(_auth_gallery_admin(request, x_api_key), "editor")
         payload = await _read_payload_any(request)
         rels = payload.get("rel_paths") if isinstance(payload, dict) else None
         if not isinstance(rels, list):
@@ -4582,7 +4693,7 @@ def create_app(
         request: Request,
         x_api_key: Optional[str] = Header(default=None),
     ) -> dict:
-        _auth_gallery_admin(request, x_api_key)
+        _gallery_require_role(_auth_gallery_admin(request, x_api_key), "editor")
         payload = await _read_payload_any(request)
         rels = payload.get("rel_paths") if isinstance(payload, dict) else None
         nc = payload.get("new_category") if isinstance(payload, dict) else None
