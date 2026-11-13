@@ -28,3 +28,7 @@ Thumbs.db
 .env
 *.pem
 *.key
+
+# Local runtime config with the API key: never in the repository.
+# On Render the key comes only from POS_HUB_API_KEY.
+poshub_runtime.json
